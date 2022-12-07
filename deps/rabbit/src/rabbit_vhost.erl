@@ -145,12 +145,32 @@ parse_tags(Val) when is_list(Val) ->
 default_limits(Name) ->
     AllLimits = application:get_env(rabbit, default_limits, []),
     VHostLimits = proplists:get_value(vhosts, AllLimits, []),
-    Match = lists:search(fun({RE, _}) ->
+    Match = lists:search(fun({_, Ss}) ->
+                                 RE = proplists:get_value(<<"pattern">>, Ss, ".*"),
                                  re:run(Name, RE, [{capture, none}]) =:= match
                          end, VHostLimits),
     case Match of
-        {value, {_, Limits}} -> Limits;
-        _                    -> []
+        {value, {_, Ss}} ->
+            proplists:delete(<<"pattern">>, Ss);
+        _ ->
+            []
+    end.
+
+-spec default_operator_policies(vhost:name()) -> {ok, binary(), proplists:proplist()} | undefined.
+default_operator_policies(Name) ->
+    AllPolicies = application:get_env(rabbit, default_operator_policies, []),
+    Match = lists:search(fun({_, Ss}) ->
+                                 RE = proplists:get_value(<<"vhost-pattern">>, Ss, ".*"),
+                                 re:run(Name, RE, [{capture, none}]) =:= match
+                         end, AllPolicies),
+    case Match of
+        {value, {PolicyName, Ss}} ->
+            QPattern = proplists:get_value(<<"queue-pattern">>, Ss, ".*"),
+            Ss1 = proplists:delete(<<"queue-pattern">>, Ss),
+            Ss2 = proplists:delete(<<"vhost-pattern">>, Ss1),
+            {PolicyName, list_to_binary(QPattern), Ss2};
+        _ ->
+            not_found
     end.
 
 -spec add(vhost:name(), rabbit_types:username()) ->
@@ -213,10 +233,22 @@ do_add(Name, Metadata, ActingUser) ->
         existing ->
             ok
     end,
-    rabbit_log:info("Applying default limits to vhost '~tp': ~tp", [Name, DefaultLimits]),
     case DefaultLimits of
-        [] -> ok;
-        _  -> ok = rabbit_vhost_limit:set(Name, DefaultLimits, ActingUser)
+        [] ->
+            ok;
+        _  ->
+            ok = rabbit_vhost_limit:set(Name, DefaultLimits, ActingUser),
+            rabbit_log:info("Applied default limits to vhost '~tp': ~tp",
+                            [Name, DefaultLimits])
+    end,
+    case default_operator_policies(Name) of
+        not_found ->
+            ok;
+        {PolicyName, QPattern, Definition} = Policy ->
+            ok = rabbit_policy:set_op(Name, PolicyName, QPattern, Definition,
+                                undefined, undefined, ActingUser),
+            rabbit_log:info("Applied default operator policy to vhost '~tp': ~tp",
+                            [Name, Policy])
     end,
     [begin
          Resource = rabbit_misc:r(Name, exchange, ExchangeName),
