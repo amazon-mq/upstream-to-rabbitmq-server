@@ -224,7 +224,7 @@ event_notify(Event, VHost, Component, Props) ->
 
 list() ->
     [p(P) || #runtime_parameters{ key = {_VHost, Comp, _Name}} = P <-
-             rabbit_db_rtparams:get_all(), Comp /= <<"policy">>].
+                 rabbit_db_rtparams:get_all(), Comp /= <<"policy">>].
 
 -spec list(rabbit_types:vhost() | '_') -> [rabbit_types:infos()].
 

@@ -1739,7 +1739,7 @@ activate_limit_all(QRefs, ChPid) ->
 deactivate_limit_all(QRefs, ChPid) ->
     QPids = [P || P <- QRefs, ?IS_CLASSIC(P)],
     delegate:invoke_no_result(QPids, {gen_server2, cast,
-                                      [{deactivate_limit, ChPid}]}).									  
+                                      [{deactivate_limit, ChPid}]}).
 
 -spec credit(amqqueue:amqqueue(),
              rabbit_types:ctag(),

@@ -36,8 +36,8 @@
 -export([format/1]).
 -export([open_files/1]).
 -export([peek/2, peek/3]).
--export([add_member/4]).
--export([delete_member/3]).
+-export([add_member/4, add_member/3]).
+-export([delete_member/3, delete_member/2]).
 -export([requeue/3]).
 -export([policy_changed/1]).
 -export([format_ra_event/3]).
@@ -191,10 +191,11 @@ start_cluster(Q) ->
     LeaderId = {RaName, Leader},
     NewQ0 = amqqueue:set_pid(Q, LeaderId),
     NewQ1 = amqqueue:set_type_state(NewQ0, #{nodes => [Leader | Followers]}),
+    NewQ2 = amqqueue:set_options(NewQ1, Opts#{init_quorum_size => QuorumSize}),
 
     rabbit_log:debug("Will start up to ~w replicas for quorum ~ts with leader on node '~ts'",
                      [QuorumSize, rabbit_misc:rs(QName), Leader]),
-    case rabbit_amqqueue:internal_declare(NewQ1, false) of
+    case rabbit_amqqueue:internal_declare(NewQ2, false) of
         {created, NewQ} ->
             TickTimeout = application:get_env(rabbit, quorum_tick_interval,
                                               ?TICK_TIMEOUT),
@@ -1071,7 +1072,7 @@ add_member(VHost, Name, Node, Timeout) ->
                 true ->
                     case lists:member(Node, QNodes) of
                         true ->
-                          %% idempotent by design
+                            %% idempotent by design
                           ok;
                         false ->
                             add_member(Q, Node, Timeout)
@@ -1456,7 +1457,8 @@ i(garbage_collection, Q) when ?is_amqqueue(Q) ->
     end;
 i(members, Q) when ?is_amqqueue(Q) ->
     get_nodes(Q);
-i(online, Q) -> online(Q);
+i(online, Q) ->
+    online(Q);
 i(leader, Q) -> leader(Q);
 i(open_files, Q) when ?is_amqqueue(Q) ->
     {Name, _} = amqqueue:get_pid(Q),
@@ -1735,5 +1737,3 @@ erpc_call(Node, M, F, A, Timeout) ->
         false ->
             {error, noconnection}
     end.
-
-

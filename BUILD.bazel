@@ -75,6 +75,12 @@ rabbitmq_run_command(
     subcommand = "start-cluster",
 )
 
+rabbitmq_run_command(
+    name = "add-node",
+    rabbitmq_run = ":rabbitmq-run",
+    subcommand = "add-node",
+)
+
 # Allow us to `bazel run stop-cluster`
 # for the equivalent of `make stop-cluster`
 rabbitmq_run_command(

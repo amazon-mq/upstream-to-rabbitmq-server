@@ -188,7 +188,19 @@ on_vhost_up(VHost) ->
                                 true  -> [QName | QNames0];
                                 false -> QNames0
                             end;
-                    (_, QNames0) ->
+                    (Q, QNames0) ->
+                            Running = rabbit_nodes:all_running(),
+                            #{nodes := Nodes} = amqqueue:get_type_state(Q),
+                            #{init_quorum_size := Size} = amqqueue:get_options(Q),
+                            NodesToRemove = Nodes -- Running,
+                            CurrentSize = length(Nodes) - length(NodesToRemove),
+                            case CurrentSize < Size of
+                                true ->
+                                    lists:foreach(fun(M) -> rabbit_quorum_queue:delete_member(Q, M) end, NodesToRemove),
+                                    rabbit_quorum_queue:add_member(Q, node(), 5000);
+                                false ->
+                                    ok
+                            end,
                             QNames0
                     end, [], rabbit_queue)
           end),
