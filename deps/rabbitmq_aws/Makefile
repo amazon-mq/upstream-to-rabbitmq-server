@@ -10,6 +10,7 @@ endef
 BUILD_DEPS = rabbit
 TEST_DEPS = meck rabbitmq_ct_helpers rabbitmq_ct_client_helpers
 LOCAL_DEPS = crypto inets ssl xmerl public_key
+DEPS = gun
 
 PLT_APPS = rabbit
 
