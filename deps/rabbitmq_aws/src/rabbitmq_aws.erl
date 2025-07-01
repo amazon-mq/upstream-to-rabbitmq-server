@@ -586,7 +586,7 @@ gun_request(State, Method, URI, Headers, Body, Options) ->
                 {Response, NewState};
             {response, nofin, Status, RespHeaders} ->
                 {ok, RespBody} = gun:await_body(ConnPid, StreamRef, Timeout),
-                Response = {ok, {{http_version, Status, status_text(Status)}, RespHeaders, binary_to_list(RespBody)}},
+                Response = {ok, {{http_version, Status, status_text(Status)}, RespHeaders, RespBody}},
                 {Response, NewState};
             {error, Reason} ->
                 {{error, Reason}, NewState}
