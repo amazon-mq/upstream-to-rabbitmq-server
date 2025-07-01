@@ -46,6 +46,9 @@
 -define(LINEAR_BACK_OFF_MILLIS, 500).
 -define(MAX_RETRIES, 5).
 
+-define(AWS_CREDENTIALS_TABLE, aws_credentials).
+-define(AWS_CONFIG_TABLE, aws_config).
+
 -type access_key() :: nonempty_string().
 -type secret_access_key() :: nonempty_string().
 -type expiration() :: calendar:datetime() | undefined.
@@ -60,6 +63,13 @@
 -record(imdsv2token, {
     token :: security_token() | undefined,
     expiration :: non_neg_integer() | undefined
+}).
+
+-record(aws_credentials, {
+    access_key :: access_key(),
+    secret_key :: secret_access_key(),
+    security_token :: security_token(),
+    expiration :: expiration()
 }).
 
 -type imdsv2token() :: #imdsv2token{}.
@@ -103,7 +113,7 @@
 -type value() :: string().
 -type header() :: {Field :: field(), Value :: value()}.
 -type headers() :: [header()].
--type body() :: string() | binary().
+-type body() :: iodata().
 
 -type ssl_options() :: [ssl:tls_client_option()].
 
