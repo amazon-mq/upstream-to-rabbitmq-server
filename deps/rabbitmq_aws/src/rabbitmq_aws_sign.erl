@@ -8,7 +8,7 @@
 -module(rabbitmq_aws_sign).
 
 %% API
--export([headers/1, request_hash/5]).
+-export([headers/1, headers/2, request_hash/5]).
 
 %% Export all for unit tests
 -ifdef(TEST).
@@ -24,13 +24,19 @@
 %% @doc Create the signed request headers
 %% end
 headers(Request) ->
+    headers(Request, undefined).
+
+headers(Request, undefined) ->
+    headers(Request, sha256(Request#request.body));
+headers(Request, PayloadHash) ->
     RequestTimestamp = local_time(),
-    PayloadHash = sha256(Request#request.body),
     URI = rabbitmq_aws_urilib:parse(Request#request.uri),
     {_, Host, _} = URI#uri.authority,
+    BodyLength = iolist_size(Request#request.body),
+
     Headers = append_headers(
         RequestTimestamp,
-        get_content_length(Request),
+        BodyLength,
         PayloadHash,
         Host,
         Request#request.security_token,
@@ -41,7 +47,7 @@ headers(Request) ->
         URI#uri.path,
         URI#uri.query,
         Headers,
-        Request#request.body
+        PayloadHash
     ),
     AuthValue = authorization(
         Request#request.access_key,
@@ -202,11 +208,11 @@ query_string(QueryArgs) -> rabbitmq_aws_urilib:build_query_string(lists:keysort(
     Path :: path(),
     QArgs :: query_args(),
     Headers :: headers(),
-    Payload :: string()
+    PayloadHash :: string()
 ) -> string().
 %% @doc Create the request hash value
 %% @end
-request_hash(Method, Path, QArgs, Headers, Payload) ->
+request_hash(Method, Path, QArgs, Headers, PayloadHash) ->
     RawPath =
         case string:slice(Path, 0, 1) of
             "/" -> Path;
@@ -220,7 +226,7 @@ request_hash(Method, Path, QArgs, Headers, Payload) ->
             query_string(QArgs),
             canonical_headers(Headers),
             signed_headers(Headers),
-            sha256(Payload)
+            PayloadHash
         ],
         "\n"
     ),
@@ -236,7 +242,7 @@ request_hash(Method, Path, QArgs, Headers, Payload) ->
 scope(AMZDate, Region, Service) ->
     string:join([AMZDate, Region, Service, "aws4_request"], "/").
 
--spec sha256(Value :: string()) -> string().
+-spec sha256(Value :: iodata()) -> string().
 %% @doc Return the SHA-256 hash for the specified value.
 %% @end
 sha256(Value) ->
@@ -313,9 +319,3 @@ string_to_sign(RequestTimestamp, RequestDate, Region, Service, RequestHash) ->
 %% @end
 sort_headers(Headers) ->
     lists:sort(fun({A, _}, {B, _}) -> string:to_lower(A) =< string:to_lower(B) end, Headers).
-
--spec get_content_length(Request :: #request{}) -> non_neg_integer().
-get_content_length(#request{body = Body}) when is_binary(Body) ->
-    byte_size(Body);
-get_content_length(#request{body = Body}) when is_list(Body) ->
-    length(Body).
