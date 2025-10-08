@@ -589,7 +589,7 @@ messages_errored(Counters) ->
     atomics:get(Counters, 3).
 
 last_offset_in_stream(Log) ->
-    osiris_log:committed_offset(Log).
+    osiris_log_reader:committed_offset(Log).
 
 augment_infos_with_user_provided_connection_name(Infos,
                                                  #stream_connection{client_properties
@@ -610,7 +610,7 @@ close(Transport,
              undefined ->
                  ok; %% segment may not be defined on subscription (single active consumer)
              L ->
-                 osiris_log:close(L)
+                 osiris_log_reader:close(L)
          end
      end || #consumer{log = Log} <- maps:values(Consumers)],
     Transport:shutdown(S, write),
@@ -771,7 +771,7 @@ open(info,
                                     ?LOG_DEBUG("Closing Osiris segment of subscription ~tp for "
                                                      "now",
                                                      [SubId]),
-                                    osiris_log:close(L),
+                                    osiris_log_reader:close(L),
                                     undefined;
                                 _ ->
                                     Log0
@@ -2552,7 +2552,7 @@ handle_frame_post_auth(Transport,
                                     Csmr
                             end,
                         #consumer{log = Log2} = Consumer2,
-                        ConsumerOffset = osiris_log:next_offset(Log2),
+                        ConsumerOffset = osiris_log_reader:next_offset(Log2),
 
                         ConsumedMessagesAfter = messages_consumed(ConsumerCounters),
                         ?LOG_DEBUG("Subscription ~tp (stream ~tp) is now at offset ~tp with ~tp "
@@ -2865,7 +2865,7 @@ init_reader(ConnectionTransport,
     {ok, Segment} = osiris:init_reader(LocalMemberPid, OffsetSpec,
                                        CounterSpec, Options1),
     ?LOG_DEBUG("Next offset for subscription ~tp is ~tp",
-               [SubscriptionId, osiris_log:next_offset(Segment)]),
+               [SubscriptionId, osiris_log_reader:next_offset(Segment)]),
     Segment.
 
 single_active_consumer(#consumer{configuration =
@@ -2914,7 +2914,7 @@ maybe_dispatch_on_subscription(Transport,
                                                       ConsumerCounters1}} =
                 ConsumerState1,
 
-            ConsumerOffset = osiris_log:next_offset(Log1),
+            ConsumerOffset = osiris_log_reader:next_offset(Log1),
             ConsumerOffsetLag = consumer_i(offset_lag, ConsumerState1),
 
             ?LOG_DEBUG("Subscription ~tp on ~tp is now at offset ~tp with ~tp "
@@ -3646,7 +3646,7 @@ send_file_callback(?VERSION_2,
     fun(#{chunk_id := FirstOffsetInChunk, num_entries := NumEntries},
         Size) ->
        FrameSize = 2 + 2 + 1 + 8 + Size,
-       CommittedChunkId = osiris_log:committed_chunk_id(Log),
+       CommittedChunkId = osiris_log_reader:committed_chunk_id(Log),
        FrameBeginning =
            <<FrameSize:32,
              ?REQUEST:1,
@@ -3726,10 +3726,10 @@ send_chunks(DeliverVersion,
             LastLstOffset,
             Retry,
             Counter) ->
-    case osiris_log:send_file(Socket, Log,
-                              send_file_callback(DeliverVersion, Log,
-                                                 Consumer,
-                                                 Counter))
+    case osiris_log_reader:send_file(Socket, Log,
+                                     send_file_callback(DeliverVersion, Log,
+                                                        Consumer,
+                                                        Counter))
     of
         {ok, Log1} ->
             send_chunks(DeliverVersion,
@@ -3763,7 +3763,7 @@ send_chunks(DeliverVersion,
                                   #consumer_configuration{member_pid =
                                                               LocalMember}} =
                         Consumer,
-                    NextOffset = osiris_log:next_offset(Log1),
+                    NextOffset = osiris_log_reader:next_offset(Log1),
                     LLO = case {LastLstOffset, NextOffset > LastLstOffset} of
                               {undefined, _} ->
                                   osiris:register_offset_listener(LocalMember,
@@ -4063,7 +4063,7 @@ get_chunk_selector(Properties) ->
 close_log(undefined) ->
     ok;
 close_log(Log) ->
-    osiris_log:close(Log).
+    osiris_log_reader:close(Log).
 
 setopts(Transport, Sock, Opts) ->
     ok = Transport:setopts(Sock, Opts).
