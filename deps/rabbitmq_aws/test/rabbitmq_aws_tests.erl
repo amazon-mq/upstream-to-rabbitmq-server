@@ -435,7 +435,7 @@ api_get_request_test_() ->
                     fun(_Pid, _, _) -> {error, "network error"} end
                 ),
 
-                Result = rabbitmq_aws:api_get_request_with_retries("AWS", "API", 3, 1),
+                Result = rabbitmq_aws:api_get_request("AWS", "API"),
                 ?assertEqual({error, "AWS service is unavailable"}, Result),
                 meck:validate(gun)
             end},
@@ -476,7 +476,7 @@ api_get_request_test_() ->
                         {ok, <<"{\"data\": \"value\"}">>}
                     ])
                 ),
-                Result = rabbitmq_aws:api_get_request_with_retries("AWS", "API", 3, 1),
+                Result = rabbitmq_aws:api_get_request("AWS", "API"),
                 ?assertEqual({ok, [{"data", "value"}]}, Result),
                 meck:validate(gun)
             end}
