@@ -47,7 +47,7 @@ get_region() ->
         [{region, Region}] ->
             Region;
         [] ->
-            {ok, DetectedRegion} =  rabbitmq_aws_config:region(),
+            {ok, DetectedRegion} = rabbitmq_aws_config:region(),
             ets:insert(?AWS_CONFIG_TABLE, {region, DetectedRegion}),
             DetectedRegion
     end.
@@ -329,7 +329,7 @@ perform_request_direct(Service, Method, Headers, Path, Body, Options, Host) ->
             ),
             gun_request(Method, URI, SignedHeaders, Body, Options);
         {error, Reason} ->
-            {error,  Reason}
+            {error, Reason}
     end.
 
 -spec endpoint(
@@ -364,7 +364,14 @@ get_credentials() ->
 
 get_credentials(Retries) ->
     case ets:lookup(?AWS_CREDENTIALS_TABLE, aws_credentials) of
-        [#aws_credentials{access_key = Key, expiration = Expiration, secret_key = SecretKey, security_token = SecurityToken}] ->
+        [
+            #aws_credentials{
+                access_key = Key,
+                expiration = Expiration,
+                secret_key = SecretKey,
+                security_token = SecurityToken
+            }
+        ] ->
             case expired_credentials(Expiration) of
                 false ->
                     Region = get_region(),
@@ -387,7 +394,14 @@ refresh_credentials_with_lock(Retries) ->
             try
                 % Double-check if someone else already refreshed
                 case ets:lookup(?AWS_CREDENTIALS_TABLE, aws_credentials) of
-                    [#aws_credentials{access_key = Key, expiration = Expiration, secret_key = SecretKey, security_token = SecurityToken}] ->
+                    [
+                        #aws_credentials{
+                            access_key = Key,
+                            expiration = Expiration,
+                            secret_key = SecretKey,
+                            security_token = SecurityToken
+                        }
+                    ] ->
                         case expired_credentials(Expiration) of
                             false ->
                                 Region = get_region(),
@@ -548,8 +562,15 @@ ensure_imdsv2_token_valid() ->
 %% @end
 api_get_request(Service, Path) ->
     ?LOG_DEBUG("invoking AWS get request {Service: ~tp; Path: ~tp}...", [Service, Path]),
-    api_request_with_retries(Service, get, Path, "", [],
-                             ?MAX_RETRIES, ?LINEAR_BACK_OFF_MILLIS).
+    api_request_with_retries(
+        Service,
+        get,
+        Path,
+        "",
+        [],
+        ?MAX_RETRIES,
+        ?LINEAR_BACK_OFF_MILLIS
+    ).
 
 -spec api_post_request(
     Service :: string(),
@@ -563,17 +584,25 @@ api_get_request(Service, Path) ->
 %% @end
 api_post_request(Service, Path, Body, Headers) ->
     ?LOG_DEBUG("invoking AWS post request {Service: ~tp; Path: ~tp}...", [Service, Path]),
-    api_request_with_retries(Service, post, Path, Body, Headers,
-                             ?MAX_RETRIES, ?LINEAR_BACK_OFF_MILLIS).
+    api_request_with_retries(
+        Service,
+        post,
+        Path,
+        Body,
+        Headers,
+        ?MAX_RETRIES,
+        ?LINEAR_BACK_OFF_MILLIS
+    ).
 
 -spec api_request_with_retries(
-        Service :: string(),
-        Method :: method(),
-        Path :: path(),
-        Body :: body(),
-        Headers :: headers(),
-        Retries :: integer(),
-        WaitTime :: integer()) ->
+    Service :: string(),
+    Method :: method(),
+    Path :: path(),
+    Body :: body(),
+    Headers :: headers(),
+    Retries :: integer(),
+    WaitTime :: integer()
+) ->
     {'ok', list()} | {'error', term()}.
 %% @doc Invoke an API call to an AWS service with retries.
 %% @end
