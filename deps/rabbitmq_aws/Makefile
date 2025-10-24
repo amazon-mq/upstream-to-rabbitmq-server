@@ -7,8 +7,9 @@ define PROJECT_ENV
 []
 endef
 
-BUILD_DEPS = rabbit
-TEST_DEPS = meck rabbitmq_ct_helpers rabbitmq_ct_client_helpers
+DEPS = gun
+BUILD_DEPS = rabbit_common rabbit
+TEST_DEPS = meck
 LOCAL_DEPS = crypto inets ssl xmerl public_key
 
 PLT_APPS = rabbit
