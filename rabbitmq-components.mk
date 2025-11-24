@@ -61,6 +61,7 @@ dep_observer_cli = hex 1.8.2
 dep_seshat = hex 1.0.0
 dep_stdout_formatter = hex 0.2.4
 dep_sysmon_handler = hex 1.3.0
+dep_rabbitmq_stream_s3 = git https://github.com/amazon-mq/rabbitmq-stream-s3.git main
 
 # RabbitMQ applications found in the monorepo.
 #
