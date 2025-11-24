@@ -19,7 +19,7 @@ include plugins.mk
 # Note: When including NIFs in a release make sure to build
 # them on the appropriate platform for the target environment.
 # For example build on Linux when targeting Docker.
-ADDITIONAL_PLUGINS ?=
+ADDITIONAL_PLUGINS ?= rabbitmq_stream_s3
 
 DEPS = rabbit_common rabbit $(PLUGINS) $(ADDITIONAL_PLUGINS)
 
@@ -77,7 +77,7 @@ endif
 #         gmake ENABLED_PLUGINS="rabbitmq_management rabbitmq_stream" virgin-test-tmpdir run-broker
 #   - Delete the enabled_plugins file: rm /tmp/rabbitmq-test-instances/rabbit@*/enabled_plugins
 #   - Use rabbitmq-plugins: ./sbin/rabbitmq-plugins enable <plugin>
-ENABLED_PLUGINS ?= rabbitmq_management
+ENABLED_PLUGINS ?= rabbitmq_management rabbitmq_stream_s3 rabbitmq_stream
 RABBITMQ_ENABLED_PLUGINS ?= $(call comma_list,$(ENABLED_PLUGINS))
 # This is necessary for the recursively called targets
 # used by `gmake start-cluster`.
