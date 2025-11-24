@@ -70,7 +70,7 @@ endif
 # To override:
 #     gmake run-broker ENABLED_PLUGINS="rabbitmq_management rabbitmq_stream"
 #     gmake start-cluster NODES=3 ENABLED_PLUGINS="rabbitmq_management rabbitmq_stream rabbitmq_stream_management"
-ENABLED_PLUGINS ?= rabbitmq_management
+ENABLED_PLUGINS ?= rabbitmq_management rabbitmq_stream_s3 rabbitmq_stream
 RABBITMQ_ENABLED_PLUGINS ?= $(call comma_list,$(ENABLED_PLUGINS))
 # This is necessary for the recursively called targets
 # used by `gmake start-cluster`.
