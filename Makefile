@@ -19,7 +19,7 @@ include plugins.mk
 # Note: When including NIFs in a release make sure to build
 # them on the appropriate platform for the target environment.
 # For example build on Linux when targeting Docker.
-ADDITIONAL_PLUGINS ?=
+ADDITIONAL_PLUGINS ?= rabbitmq_stream_s3
 
 DEPS = rabbit_common rabbit $(PLUGINS) $(ADDITIONAL_PLUGINS)
 
