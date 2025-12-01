@@ -39,7 +39,9 @@
 -include("rabbitmq_aws.hrl").
 -include_lib("kernel/include/logger.hrl").
 
--type connection_handle() :: {pid(), string()}.
+-opaque connection_handle() :: {pid(), string()}.
+
+-export_type([connection_handle/0]).
 
 -spec get_region() -> region().
 get_region() ->
@@ -206,7 +208,7 @@ sign_headers(
     ).
 
 -spec request(
-    Service :: string(),
+    ServiceOrHandle :: string() | connection_handle(),
     Method :: method(),
     Path :: path(),
     Body :: body(),
@@ -220,7 +222,7 @@ request(Service, Method, Path, Body, Headers) ->
     request(Service, Method, Path, Body, Headers, []).
 
 -spec request(
-    Service :: string(),
+    ServiceOrHandle :: string() | connection_handle(),
     Method :: method(),
     Path :: path(),
     Body :: body(),

@@ -57,7 +57,7 @@
 -type expiration() :: calendar:datetime() | undefined.
 -type security_token() :: nonempty_string() | undefined.
 -type region() :: nonempty_string() | undefined.
--type path() :: string().
+-type path() :: string() | {string(), string()}.
 
 -type sc_ok() :: {ok, access_key(), secret_access_key(), expiration(), security_token()}.
 -type sc_error() :: {error, Reason :: atom()}.
@@ -150,10 +150,10 @@
     | {ok, {status_code(), body()}}
     | {error, term()}.
 
--type result_ok() :: {ok, {ResponseHeaders :: headers(), Response :: list()}}.
+-type result_ok() :: {ok, {ResponseHeaders :: [{binary(), binary()}], Response :: binary()}}.
 -type result_error() ::
     {'error', Message :: reason_phrase(),
-        {ResponseHeaders :: headers(), Response :: list()} | undefined}
+        {ResponseHeaders :: [{binary(), binary()}], Response :: binary()} | undefined}
     | {'error', {credentials, Reason :: string()}}
     | {'error', string()}.
 -type result() :: result_ok() | result_error().
