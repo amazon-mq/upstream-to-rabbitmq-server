@@ -52,7 +52,7 @@ dep_jose = hex 1.11.10
 dep_khepri = hex 0.17.5
 dep_khepri_mnesia_migration = hex 0.8.1
 dep_meck = hex 1.0.0
-dep_osiris = git https://github.com/rabbitmq/osiris v1.12.0
+dep_osiris = git https://github.com/amazon-mq/upstream-to-osiris tiered-storage-abstractions
 dep_prometheus = hex 6.1.1
 dep_ra = hex 2.17.2
 dep_ranch = hex 2.2.0
@@ -64,6 +64,7 @@ dep_observer_cli = hex 1.8.2
 dep_seshat = hex 1.0.1
 dep_stdout_formatter = hex 0.2.4
 dep_sysmon_handler = hex 1.3.0
+dep_rabbitmq_stream_s3 = git https://github.com/amazon-mq/rabbitmq-stream-s3.git main
 
 # RabbitMQ applications found in the monorepo.
 #

@@ -92,8 +92,8 @@
                  start_offset = 0 :: non_neg_integer(),
                  listening_offset = 0 :: non_neg_integer(),
                  last_consumed_offset :: non_neg_integer(),
-                 log :: undefined | osiris_log:state(),
-                 chunk_iterator :: undefined | osiris_log:chunk_iterator(),
+                 log :: undefined | osiris_log_reader:state(),
+                 chunk_iterator :: undefined | osiris_log_reader:chunk_iterator(),
                  %% These messages were already read ahead from the Osiris log,
                  %% were part of an uncompressed sub batch, and are buffered in
                  %% reversed order until the consumer has more credits to consume them.
@@ -469,7 +469,7 @@ begin_stream(#stream_client{name = QName,
     CounterSpec = {{?MODULE, QName, Tag, self()}, []},
     Options1 = Options0#{read_ahead => read_ahead()},
     {ok, Seg0} = osiris:init_reader(LocalPid, Offset, CounterSpec, Options1),
-    NextOffset = osiris_log:next_offset(Seg0) - 1,
+    NextOffset = osiris_log_reader:next_offset(Seg0) - 1,
     osiris:register_offset_listener(LocalPid, NextOffset),
     StartOffset = case Offset of
                       first -> NextOffset;
@@ -654,14 +654,14 @@ handle_event(_QName, {stream_local_member_change, Pid},
                             readers = Readers0} = State) ->
     ?LOG_DEBUG("Local member change event for ~tp", [QName]),
     Readers1 = maps:fold(fun(T, #stream{log = Log0, reader_options = Options} = S0, Acc) ->
-                                 Offset = osiris_log:next_offset(Log0),
-                                 osiris_log:close(Log0),
+                                 Offset = osiris_log_reader:next_offset(Log0),
+                                 osiris_log_reader:close(Log0),
                                  CounterSpec = {{?MODULE, QName, self()}, []},
                                  ?LOG_DEBUG("Re-creating Osiris reader for consumer ~tp at offset ~tp "
                                             " with options ~tp",
                                             [T, Offset, Options]),
                                  {ok, Log1} = osiris:init_reader(Pid, Offset, CounterSpec, Options),
-                                 NextOffset = osiris_log:next_offset(Log1) - 1,
+                                 NextOffset = osiris_log_reader:next_offset(Log1) - 1,
                                  ?LOG_DEBUG("Registering offset listener at offset ~tp", [NextOffset]),
                                  osiris:register_offset_listener(Pid, NextOffset),
                                  S1 = S0#stream{listening_offset = NextOffset,
@@ -1303,7 +1303,7 @@ stream_entries(QName, Name, CTag, LocalPid,
                        start_offset = StartOffset,
                        filter = Filter,
                        unmatched = Unmatched} = Str0, Acc0) ->
-    case osiris_log:iterator_next(Iter0) of
+    case osiris_log_reader:iterator_next(Iter0) of
         end_of_chunk when Unmatched > ?UNMATCHED_THRESHOLD ->
             %% Pause filtering temporariliy for two reasons:
             %% 1. Process Erlang messages in our mailbox to avoid blocking other links
@@ -1377,12 +1377,12 @@ stream_entries(QName, Name, CTag, LocalPid,
 chunk_iterator(#stream{credit = Credit,
                        listening_offset = LOffs,
                        log = Log0} = Str0, LocalPid, PrevIterator) ->
-    case osiris_log:chunk_iterator(Log0, Credit, PrevIterator) of
+    case osiris_log_reader:chunk_iterator(Log0, Credit, PrevIterator) of
         {ok, _ChunkHeader, Iter, Log} ->
             {ok, Str0#stream{chunk_iterator = Iter,
                              log = Log}};
         {end_of_stream, Log} ->
-            NextOffset = osiris_log:next_offset(Log),
+            NextOffset = osiris_log_reader:next_offset(Log),
             Str = case NextOffset > LOffs of
                       true ->
                           osiris:register_offset_listener(LocalPid, NextOffset),
@@ -1502,7 +1502,7 @@ set_leader_pid(Pid, QName) ->
 
 close_log(undefined) -> ok;
 close_log(Log) ->
-    osiris_log:close(Log).
+    osiris_log_reader:close(Log).
 
 %% this is best effort only; the state of replicas is slightly stale and things can happen
 %% between the time this function is called and the time decision based on its result is made
@@ -1552,7 +1552,7 @@ credit_reply(_, Str) ->
 %% Returns only an approximation.
 available_messages(#stream{log = Log,
                            last_consumed_offset = LastConsumedOffset}) ->
-    max(0, osiris_log:committed_offset(Log) - LastConsumedOffset).
+    max(0, osiris_log_reader:committed_offset(Log) - LastConsumedOffset).
 
 deliver_actions(_, _, []) ->
     [];
