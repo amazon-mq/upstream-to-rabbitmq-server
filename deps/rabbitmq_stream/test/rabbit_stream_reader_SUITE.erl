@@ -279,6 +279,63 @@ publishing_ids_from_messages_v1_test(_) ->
                  publishing_ids_from_messages(?VERSION_1, <<SimpleEntry/binary, BatchEntry/binary>>)),
     ok.
 
+handle_subscription_reader_unavailable_test(_) ->
+    Mod = rabbit_stream_reader,
+    meck:new(Mod, [passthrough]),
+    meck:new(rabbit_global_counters, [stub_all]),
+
+    ModOsiris = osiris,
+    meck:new(ModOsiris),
+    meck:expect(ModOsiris, init_reader, fun(_, _, _, _) -> {error, unavailable} end),
+
+    ModTransport = dummy_transport,
+    meck:new(ModTransport, [non_strict]),
+    meck:expect(ModTransport, send, 2, ok),
+
+    ModCore = rabbit_stream_core,
+    meck:new(ModCore, [passthrough]),
+    put(sent_frames, []),
+    meck:expect(ModCore, frame, fun(Cmd) -> put(sent_frames, [Cmd | get(sent_frames)]), Cmd end),
+
+    Stream = <<"s1">>,
+    SubscriptionId = 0,
+    CorrelationId = 42,
+    LocalMemberPid = new_process(),
+
+    Connection = #stream_connection{name = <<"conn1">>,
+                                    socket = socket,
+                                    stream_subscriptions = #{},
+                                    virtual_host = <<"/">>,
+                                    send_file_oct = atomics:new(1, [{signed, false}]),
+                                    transport = tcp},
+    State = #stream_connection_state{consumers = #{}},
+
+    %% `single-active-consumer` is not set, so `init_reader/6` (and thus
+    %% the mocked `osiris:init_reader/4`) is actually exercised: without
+    %% this, the SAC branch would short-circuit to `{ok, undefined}` and
+    %% the test would pass without ever touching the fixed code path.
+    {ReturnedConnection, ReturnedState} =
+        Mod:handle_subscription(ModTransport, Connection, State,
+                                {request, CorrelationId,
+                                 {subscribe, SubscriptionId, Stream,
+                                  next, 100, #{}}},
+                                LocalMemberPid),
+
+    ?assert(meck:called(ModOsiris, init_reader, '_')),
+
+    %% The connection did not crash and must not have registered the
+    %% failed subscription.
+    ?assertEqual(#{}, ReturnedConnection#stream_connection.stream_subscriptions),
+    ?assertEqual(#{}, ReturnedState#stream_connection_state.consumers),
+
+    %% A retryable subscribe error, not a closed/crashed connection.
+    SentFrames = get(sent_frames),
+    erase(sent_frames),
+    ?assertEqual([{response, CorrelationId,
+                  {subscribe, ?RESPONSE_CODE_STREAM_NOT_AVAILABLE}}],
+                 SentFrames),
+    ok.
+
 consumer(S, Pid) ->
     #consumer{configuration = #consumer_configuration{stream = S,
                                                       member_pid = Pid}}.

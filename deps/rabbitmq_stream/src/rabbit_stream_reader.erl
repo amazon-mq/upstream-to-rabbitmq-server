@@ -120,7 +120,8 @@
          evaluate_state_after_secret_update/4,
          clean_subscriptions/4,
          negotiate_frame_max/2,
-         publishing_ids_from_messages/2]).
+         publishing_ids_from_messages/2,
+         handle_subscription/5]).
 -endif.
 
 callback_mode() ->
@@ -680,7 +681,7 @@ messages_errored(Counters) ->
     atomics:get(Counters, 3).
 
 last_offset_in_stream(Log) ->
-    osiris_log:committed_offset(Log).
+    osiris_log_reader:committed_offset(Log).
 
 augment_infos_with_user_provided_connection_name(Infos,
                                                  #stream_connection{client_properties
@@ -701,7 +702,7 @@ close(Transport,
              undefined ->
                  ok; %% segment may not be defined on subscription (single active consumer)
              L ->
-                 osiris_log:close(L)
+                 osiris_log_reader:close(L)
          end
      end || #consumer{log = Log} <- maps:values(Consumers)],
     Transport:shutdown(S, write),
@@ -860,7 +861,7 @@ open(info,
                                     ?LOG_DEBUG("Closing Osiris segment of subscription ~tp for "
                                                      "now",
                                                      [SubId]),
-                                    osiris_log:close(L),
+                                    osiris_log_reader:close(L),
                                     undefined;
                                 _ ->
                                     Log0
@@ -2795,58 +2796,65 @@ handle_frame_post_auth(Transport,
                                       kind = queue,
                                       virtual_host = VirtualHost},
 
-                        Segment =
-                            init_reader(ConnTransport,
-                                        LocalMemberPid,
-                                        QueueResource,
-                                        SubscriptionId,
-                                        Properties,
-                                        OffsetSpec),
-                        Consumer1 = Consumer#consumer{log = Segment},
-                        #consumer{credit = Crdt,
-                                  send_limit = SndLmt,
-                                  configuration = #consumer_configuration{counters = ConsumerCounters}} = Consumer1,
+                        case init_reader(ConnTransport,
+                                         LocalMemberPid,
+                                         QueueResource,
+                                         SubscriptionId,
+                                         Properties,
+                                         OffsetSpec) of
+                            {ok, Segment} ->
+                                Consumer1 = Consumer#consumer{log = Segment},
+                                #consumer{credit = Crdt,
+                                          send_limit = SndLmt,
+                                          configuration = #consumer_configuration{counters = ConsumerCounters}} = Consumer1,
 
-                        ?LOG_DEBUG("Dispatching to subscription ~tp (stream ~tp), "
-                                         "credit(s) ~tp, send limit ~tp",
-                                         [SubscriptionId,
-                                          Stream,
-                                          Crdt,
-                                          SndLmt]),
+                                ?LOG_DEBUG("Dispatching to subscription ~tp (stream ~tp), "
+                                                 "credit(s) ~tp, send limit ~tp",
+                                                 [SubscriptionId,
+                                                  Stream,
+                                                  Crdt,
+                                                  SndLmt]),
 
-                        ConsumedMessagesBefore = messages_consumed(ConsumerCounters),
+                                ConsumedMessagesBefore = messages_consumed(ConsumerCounters),
 
-                        Consumer2 =
-                            case send_chunks(DeliverVersion,
-                                             Transport,
-                                             Consumer1,
-                                             SendFileOct)
-                            of
-                                {error, closed} ->
-                                    ?LOG_INFO("Stream protocol connection has been closed by "
-                                                               "peer",
-                                                               []),
-                                    throw({stop, normal});
-                                {error, Reason} ->
-                                    ?LOG_INFO("Error while sending chunks: ~tp",
-                                                               [Reason]),
-                                    %% likely a connection problem
-                                    Consumer;
-                                {ok, Csmr} ->
-                                    Csmr
-                            end,
-                        #consumer{log = Log2} = Consumer2,
-                        ConsumerOffset = osiris_log:next_offset(Log2),
+                                Consumer2 =
+                                    case send_chunks(DeliverVersion,
+                                                     Transport,
+                                                     Consumer1,
+                                                     SendFileOct)
+                                    of
+                                        {error, closed} ->
+                                            ?LOG_INFO("Stream protocol connection has been closed by "
+                                                                       "peer",
+                                                                       []),
+                                            throw({stop, normal});
+                                        {error, Reason} ->
+                                            ?LOG_INFO("Error while sending chunks: ~tp",
+                                                                       [Reason]),
+                                            %% likely a connection problem
+                                            Consumer;
+                                        {ok, Csmr} ->
+                                            Csmr
+                                    end,
+                                #consumer{log = Log2} = Consumer2,
+                                ConsumerOffset = osiris_log_reader:next_offset(Log2),
 
-                        ConsumedMessagesAfter = messages_consumed(ConsumerCounters),
-                        ?LOG_DEBUG("Subscription ~tp (stream ~tp) is now at offset ~tp with ~tp "
-                                         "message(s) distributed after subscription",
-                                         [SubscriptionId,
-                                          Stream,
-                                          ConsumerOffset,
-                                          ConsumedMessagesAfter - ConsumedMessagesBefore]),
+                                ConsumedMessagesAfter = messages_consumed(ConsumerCounters),
+                                ?LOG_DEBUG("Subscription ~tp (stream ~tp) is now at offset ~tp with ~tp "
+                                                 "message(s) distributed after subscription",
+                                                 [SubscriptionId,
+                                                  Stream,
+                                                  ConsumerOffset,
+                                                  ConsumedMessagesAfter - ConsumedMessagesBefore]),
 
-                        Consumers#{SubscriptionId => Consumer2};
+                                Consumers#{SubscriptionId => Consumer2};
+                            {error, Reason} ->
+                                ?LOG_WARNING("Cannot initialize reader for active consumer "
+                                                   "(subscription ~tp, stream ~tp): ~tp",
+                                                   [SubscriptionId, Stream, Reason]),
+                                Consumers#{SubscriptionId =>
+                                           Consumer#consumer{log = undefined}}
+                        end;
                     #{SubscriptionId :=
                           #consumer{configuration =
                                         #consumer_configuration{active = false,
@@ -3169,11 +3177,14 @@ init_reader(ConnectionTransport,
                  read_ahead => rabbit_stream_queue:read_ahead()},
 
     Options1 = maps:merge(Options0, reader_options(Properties)),
-    {ok, Segment} = osiris:init_reader(LocalMemberPid, OffsetSpec,
-                                       CounterSpec, Options1),
-    ?LOG_DEBUG("Next offset for subscription ~tp is ~tp",
-               [SubscriptionId, osiris_log:next_offset(Segment)]),
-    Segment.
+    case osiris:init_reader(LocalMemberPid, OffsetSpec, CounterSpec, Options1) of
+        {ok, Segment} ->
+            ?LOG_DEBUG("Next offset for subscription ~tp is ~tp",
+                       [SubscriptionId, osiris_log_reader:next_offset(Segment)]),
+            {ok, Segment};
+        {error, _} = Error ->
+            Error
+    end.
 
 single_active_consumer(#consumer{} = Consumer) ->
     single_active_consumer(consumer_properties(Consumer));
@@ -3225,7 +3236,7 @@ maybe_dispatch_on_subscription(Transport,
                                                       ConsumerCounters1}} =
                 ConsumerState1,
 
-            ConsumerOffset = osiris_log:next_offset(Log1),
+            ConsumerOffset = osiris_log_reader:next_offset(Log1),
             ConsumerOffsetLag = consumer_i(offset_lag, ConsumerState1),
 
             ?LOG_DEBUG("Subscription ~tp on ~tp is now at offset ~tp with ~tp "
@@ -3300,68 +3311,81 @@ handle_subscription(Transport,#stream_connection{
     case maybe_register_consumer(VirtualHost, Stream, ConsumerName, ConnName,
                                  SubscriptionId, Properties, Sac) of
         {ok, Active} ->
-            Log = case Sac of
-                      true ->
-                          undefined;
-                      false ->
-                          init_reader(ConnTransport,
-                                      LocalMemberPid,
-                                      QueueResource,
-                                      SubscriptionId,
-                                      Properties,
-                                      OffsetSpec)
-                  end,
+            LogResult = case Sac of
+                            true ->
+                                {ok, undefined};
+                            false ->
+                                init_reader(ConnTransport,
+                                            LocalMemberPid,
+                                            QueueResource,
+                                            SubscriptionId,
+                                            Properties,
+                                            OffsetSpec)
+                        end,
+            case LogResult of
+                {ok, Log} ->
+                    ConsumerCounters = atomics:new(2, [{signed, false}]),
 
-            ConsumerCounters = atomics:new(2, [{signed, false}]),
+                    response_ok(Transport,
+                                Connection,
+                                subscribe,
+                                CorrelationId),
 
-            response_ok(Transport,
-                        Connection,
-                        subscribe,
-                        CorrelationId),
+                    ConsumerConfiguration = #consumer_configuration{
+                                               member_pid = LocalMemberPid,
+                                               subscription_id = SubscriptionId,
+                                               socket = Socket,
+                                               stream = Stream,
+                                               offset = OffsetSpec,
+                                               counters = ConsumerCounters,
+                                               properties = Properties,
+                                               active = Active},
+                    SendLimit = Credit div 2,
+                    ConsumerState =
+                    #consumer{configuration = ConsumerConfiguration,
+                              log = Log,
+                              send_limit = SendLimit,
+                              credit = Credit},
 
-            ConsumerConfiguration = #consumer_configuration{
-                                       member_pid = LocalMemberPid,
-                                       subscription_id = SubscriptionId,
-                                       socket = Socket,
-                                       stream = Stream,
-                                       offset = OffsetSpec,
-                                       counters = ConsumerCounters,
-                                       properties = Properties,
-                                       active = Active},
-            SendLimit = Credit div 2,
-            ConsumerState =
-            #consumer{configuration = ConsumerConfiguration,
-                      log = Log,
-                      send_limit = SendLimit,
-                      credit = Credit},
+                    Connection1 = maybe_monitor_stream(LocalMemberPid,
+                                                       Stream,
+                                                       Connection),
 
-            Connection1 = maybe_monitor_stream(LocalMemberPid,
-                                               Stream,
-                                               Connection),
-
-            State1 = maybe_dispatch_on_subscription(Transport,
-                                                    State,
-                                                    ConsumerState,
-                                                    Connection1,
-                                                    Consumers,
-                                                    Stream,
-                                                    SubscriptionId,
-                                                    Properties,
-                                                    SendFileOct,
-                                                    Sac),
-            StreamSubscriptions1 =
-            case StreamSubscriptions of
-                #{Stream := SubscriptionIds} ->
-                    StreamSubscriptions#{Stream =>
-                                         [SubscriptionId | SubscriptionIds]};
-                _ ->
-                    StreamSubscriptions#{Stream =>
-                                         [SubscriptionId]}
-            end,
-            {Connection1#stream_connection{stream_subscriptions
-                                           =
-                                           StreamSubscriptions1},
-             State1};
+                    State1 = maybe_dispatch_on_subscription(Transport,
+                                                            State,
+                                                            ConsumerState,
+                                                            Connection1,
+                                                            Consumers,
+                                                            Stream,
+                                                            SubscriptionId,
+                                                            Properties,
+                                                            SendFileOct,
+                                                            Sac),
+                    StreamSubscriptions1 =
+                    case StreamSubscriptions of
+                        #{Stream := SubscriptionIds} ->
+                            StreamSubscriptions#{Stream =>
+                                                 [SubscriptionId | SubscriptionIds]};
+                        _ ->
+                            StreamSubscriptions#{Stream =>
+                                                 [SubscriptionId]}
+                    end,
+                    {Connection1#stream_connection{stream_subscriptions
+                                                   =
+                                                   StreamSubscriptions1},
+                     State1};
+                {error, Reason} ->
+                    ?LOG_WARNING("Cannot initialize reader for subscription ~tp "
+                                       "on stream ~tp: ~tp",
+                                       [SubscriptionId, Stream, Reason]),
+                    increase_protocol_counter(?STREAM_NOT_AVAILABLE),
+                    response(Transport,
+                             Connection,
+                             subscribe,
+                             CorrelationId,
+                             ?RESPONSE_CODE_STREAM_NOT_AVAILABLE),
+                    {Connection, State}
+            end;
         {error, Reason} ->
             ?LOG_WARNING("Cannot create SAC subcription ~tp: ~tp",
                                [SubscriptionId, Reason]),
@@ -3946,7 +3970,7 @@ send_file_callback(?VERSION_2,
     fun(#{chunk_id := FirstOffsetInChunk, num_entries := NumEntries},
         Size) ->
        FrameSize = 2 + 2 + 1 + 8 + Size,
-       CommittedChunkId = osiris_log:committed_chunk_id(Log),
+       CommittedChunkId = osiris_log_reader:committed_chunk_id(Log),
        FrameBeginning =
            <<FrameSize:32,
              ?REQUEST:1,
@@ -4047,10 +4071,10 @@ send_chunks(DeliverVersion,
             LastLstOffset,
             Retry,
             Counter) ->
-    case osiris_log:send_file(Socket, Log,
-                              send_file_callback(DeliverVersion, Log,
-                                                 Consumer,
-                                                 Counter))
+    case osiris_log_reader:send_file(Socket, Log,
+                                     send_file_callback(DeliverVersion, Log,
+                                                        Consumer,
+                                                        Counter))
     of
         {ok, Log1} ->
             send_chunks(DeliverVersion,
@@ -4084,7 +4108,7 @@ send_chunks(DeliverVersion,
                                   #consumer_configuration{member_pid =
                                                               LocalMember}} =
                         Consumer,
-                    NextOffset = osiris_log:next_offset(Log1),
+                    NextOffset = osiris_log_reader:next_offset(Log1),
                     LLO = case {LastLstOffset, NextOffset > LastLstOffset} of
                               {undefined, _} ->
                                   osiris:register_offset_listener(LocalMember,
@@ -4382,7 +4406,7 @@ reader_options(Properties) ->
 close_log(undefined) ->
     ok;
 close_log(Log) ->
-    osiris_log:close(Log).
+    osiris_log_reader:close(Log).
 
 setopts(Transport, Sock, Opts) ->
     ok = Transport:setopts(Sock, Opts).
