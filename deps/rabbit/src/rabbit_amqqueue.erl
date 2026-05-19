@@ -735,7 +735,15 @@ equivalence_check_level(Q, NewArgs) ->
             ExistingArgs = amqqueue:get_arguments(Q),
             OldType = rabbit_misc:table_lookup(ExistingArgs, <<"x-queue-type">>),
             NewType = rabbit_misc:table_lookup(NewArgs, <<"x-queue-type">>),
+            rabbit_log:debug("@@@@ ExistingArgs ~tp", [ExistingArgs]),
+            rabbit_log:debug("@@@@ OldType ~tp", [OldType]),
+            rabbit_log:debug("@@@@ NewType ~tp", [NewType]),
+            %% ExistingArgs []
+            %% OldType undefined
+            %% NewType {longstr,<<"quorum">>}
             case {OldType, NewType} of
+                {undefined, {longstr, <<"quorum">>}} ->
+                    relaxed_checks;
                 {{longstr, <<"quorum">>}, {longstr, <<"classic">>}} ->
                     relaxed_checks;
                 _ ->
