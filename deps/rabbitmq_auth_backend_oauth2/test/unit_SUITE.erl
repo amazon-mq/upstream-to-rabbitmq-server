@@ -48,6 +48,7 @@ all() ->
         test_invalid_signature,
         test_incorrect_kid,
         normalize_token_scope_using_multiple_scopes_key,
+        normalize_token_scope_using_dotted_claim_name,
         normalize_token_scope_with_requesting_party_token_scopes,
         normalize_token_scope_with_rich_auth_request,
         normalize_token_scope_with_rich_auth_request_using_regular_expression_with_cluster,
@@ -193,6 +194,36 @@ normalize_token_scope_using_multiple_scopes_key(_) ->
         ResourceServer0 = new_resource_server(<<"rabbitmq-resource">>),
         ResourceServer = ResourceServer0#resource_server{
             additional_scopes_key = <<"authorization.permissions.scopes realm_access.roles resource_access.account.roles">>
+            },
+        {ok, Token} = normalize_token_scope(ResourceServer, Token0),
+        ?assertEqual(lists:sort(ExpectedScope), lists:sort(uaa_jwt:get_scope(Token)), Case)
+        end, Pairs).
+
+%% A claim name may itself contain dots, for example when it is namespaced
+%% with a URI. Such dots are escaped as "\." in additional_scopes_key so that
+%% they are treated as part of the claim name rather than as path separators.
+normalize_token_scope_using_dotted_claim_name(_) ->
+    Pairs = [
+        {
+            "URI-namespaced claim, e.g. AWS STS federated identity token",
+            <<"https://sts\\.amazonaws\\.com/.request_tags.scope">>,
+            #{<<"https://sts.amazonaws.com/">> =>
+                #{<<"request_tags">> =>
+                    #{<<"scope">> => <<"rabbitmq-resource.tag:administrator">>}}},
+            [<<"tag:administrator">>]
+        },
+        {
+            "escaped dot in a top-level claim name",
+            <<"custom\\.roles">>,
+            #{<<"custom.roles">> => [<<"rabbitmq-resource.read:*/*">>]},
+            [<<"read:*/*">>]
+        }
+    ],
+
+    lists:foreach(fun({Case, Key, Token0, ExpectedScope}) ->
+        ResourceServer0 = new_resource_server(<<"rabbitmq-resource">>),
+        ResourceServer = ResourceServer0#resource_server{
+            additional_scopes_key = Key
             },
         {ok, Token} = normalize_token_scope(ResourceServer, Token0),
         ?assertEqual(lists:sort(ExpectedScope), lists:sort(uaa_jwt:get_scope(Token)), Case)

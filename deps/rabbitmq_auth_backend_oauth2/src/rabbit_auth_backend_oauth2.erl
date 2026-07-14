@@ -407,8 +407,12 @@ extract_token_value_from_list(R, [_ | T], Acc, KeyList, Mapper) ->
     extract_token_value_from_list(R, T, Acc, KeyList, Mapper).
 
 
+%% A path is split on unescaped dots. A literal dot within a claim name
+%% (common in URI-namespaced claims such as "https://sts.amazonaws.com/")
+%% is escaped as "\." following the same convention as cuttlefish keys.
 split_path(Path) when is_binary(Path) ->
-    binary:split(Path, <<".">>, [global, trim_all]).
+    Tokens = cuttlefish_variable:tokenize(binary_to_list(Path)),
+    [list_to_binary(T) || T <- Tokens, T =/= []].
 
 
 -spec extract_scopes_from_additional_scopes_key(
