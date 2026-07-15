@@ -9,6 +9,23 @@
 -compile(export_all).
 
 -define(NUM_TESTS, 500).
+%% The consumer timeout property uses fewer but much longer runs
+%% (see the more_commands/2 factor in its prop function): the scenarios
+%% it exists to catch are long ordered chains of commands, for example
+%% publish, consume stalled, time out, consume again on the same
+%% channel, then settle the timed-out delivery while the redelivery
+%% is unacknowledged.
+-define(TIMEOUT_NUM_TESTS, 100).
+-define(TIMEOUT_CMD_FACTOR, 5).
+
+%% Consumer timeout used by stalled consumers. It must be long enough for
+%% deliveries to reach the client under load and short enough to keep test
+%% runs fast. cmd_channel_await_timeout sleeps 4x this value so that every
+%% delivery made to a stalled consumer has timed out by the time it
+%% returns, and cmd_channel_settle_stale settles at least 3x this value
+%% after a delivery was received so that the settlement is always of a
+%% timed-out delivery, never of a live one.
+-define(STALL_TIMEOUT, 100).
 
 %% Set to true to get an awful lot of debug logs.
 -if(false).
@@ -67,19 +84,31 @@
     %% the cancelling and the message going back to the queue, and the test
     %% suite getting messages via basic.get.
     consumers = false :: boolean(),
-    channels = #{} :: #{pid() => #{consumer := none | binary(), confirms := boolean()}}
+    channels = #{} :: #{pid() => #{consumer := none | binary() | {stalled, binary()},
+                                   confirms := boolean(),
+                                   stalled_done := boolean()}},
+
+    %% Whether commands exercising the consumer timeout (stalled
+    %% consumers) are generated, and whether the property ends with a
+    %% drain of the queue verifying that no message was lost.
+    timeouts_enabled = false :: boolean(),
+    drain = false :: boolean()
 }).
 
 %% Common Test.
 
 all() ->
-    [{group, classic_queue_tests}].
+    [{group, classic_queue_tests},
+     {group, classic_queue_timeout_tests}].
 
 groups() ->
     [{classic_queue_tests, [], [
 %        manual%,
         classic_queue_v2,
         reg_recovery_tune_read_crash
+     ]},
+     {classic_queue_timeout_tests, [], [
+        classic_queue_consumer_timeout
      ]}
     ].
 
@@ -200,6 +229,15 @@ do_classic_queue_v2(Config) ->
                              [{on_output, on_output_fun()},
                               {numtests, ?NUM_TESTS}]).
 
+classic_queue_consumer_timeout(Config) ->
+    true = rabbit_ct_broker_helpers:rpc(Config, 0,
+        ?MODULE, do_classic_queue_consumer_timeout, [Config]).
+
+do_classic_queue_consumer_timeout(Config) ->
+    true = proper:quickcheck(prop_classic_queue_consumer_timeout(Config),
+                             [{on_output, on_output_fun()},
+                              {numtests, ?TIMEOUT_NUM_TESTS}]).
+
 on_output_fun() ->
     fun (".", _) -> ok; % don't print the '.'s on new lines
         ("!", _) -> ok;
@@ -217,14 +255,28 @@ prop_classic_queue_v2(Config) ->
                        limiter=LimiterPid},
     prop_common(InitialState).
 
+prop_classic_queue_consumer_timeout(Config) ->
+    {ok, LimiterPid} = rabbit_limiter:start_link(no_id),
+    InitialState = #cq{name=?FUNCTION_NAME,
+                       config=minimal_config(Config),
+                       limiter=LimiterPid,
+                       timeouts_enabled=true,
+                       drain=true},
+    prop_common(InitialState, ?TIMEOUT_CMD_FACTOR).
+
 prop_common(InitialState) ->
-    ?FORALL(Commands, commands(?MODULE, InitialState),
+    prop_common(InitialState, 1).
+
+prop_common(InitialState, CmdFactor) ->
+    ?FORALL(Commands, more_commands(CmdFactor, commands(?MODULE, InitialState)),
         ?TRAPEXIT(begin
             {History, State, Result} = run_commands(?MODULE, Commands),
+            Drained = Result =/= ok orelse cmd_drain_and_check(State),
             cmd_teardown_queue(State),
-            ?WHENFAIL(?LOG_ERROR("History: ~tp~nState: ~tp~nResult: ~tp",
-                                   [History, State, Result]),
-                      aggregate(command_names(Commands), Result =:= ok))
+            ?WHENFAIL(?LOG_ERROR("History: ~tp~nState: ~tp~nResult: ~tp~nDrained: ~tp",
+                                   [History, State, Result, Drained]),
+                      aggregate(command_names(Commands),
+                                Result =:= ok andalso Drained))
         end)
     ).
 
@@ -258,7 +310,7 @@ command(St) ->
             {300, {call, ?MODULE, cmd_channel_receive_many_and_ack_ooo, [St, channel(St), integer(2, 10)]}},
             {300, {call, ?MODULE, cmd_channel_receive_many_and_requeue_ooo, [St, channel(St), integer(2, 10)]}},
             {300, {call, ?MODULE, cmd_channel_receive_many_and_discard_ooo, [St, channel(St), integer(2, 10)]}}
-        ]
+        ] ++ stall_commands(St)
     end,
     weighted_union([
         %% These restart the vhost or the queue.
@@ -277,6 +329,23 @@ command(St) ->
         |ChannelCmds
     ]).
 
+%% Commands exercising the consumer timeout. A stalled consumer receives
+%% deliveries and never acknowledges them; the queue times the deliveries
+%% out, requeues them and withholds the consumer. The settlement of the
+%% timed-out deliveries is then exercised against redeliveries of the
+%% same messages, which on classic queues reuse the same ack tag.
+stall_commands(#cq{timeouts_enabled=false}) ->
+    [];
+stall_commands(St) ->
+    %% Weights increase along the chain so that a started stall cycle
+    %% is likely to progress through await, harvest and settlement.
+    [
+        {500, {call, ?MODULE, cmd_channel_consume_stalled, [St, channel(St)]}},
+        {900, {call, ?MODULE, cmd_channel_await_timeout, [St, channel(St)]}},
+        {900, {call, ?MODULE, cmd_channel_stall_receive, [St, channel(St)]}},
+        {900, {call, ?MODULE, cmd_channel_settle_stale, [St, channel(St), integer(1, 10)]}}
+    ].
+
 expiration() ->
     oneof([
         undefined,
@@ -288,6 +357,16 @@ has_channels(#cq{channels=Channels}) ->
 
 channel(#cq{channels=Channels}) ->
     elements(maps:keys(Channels)).
+
+is_stalled({stalled, _}) -> true;
+is_stalled(_) -> false.
+
+%% A consumer the test suite may receive from or cancel: stalled
+%% consumers deliberately leave their deliveries pending and are only
+%% terminated via cmd_channel_await_timeout.
+is_active_consumer(none) -> false;
+is_active_consumer({stalled, _}) -> false;
+is_active_consumer(_) -> true.
 
 %% Next state.
 
@@ -354,7 +433,8 @@ next_state(St=#cq{q=Q, uncertain=Uncertain0}, _, {call, _, cmd_purge, _}) ->
     end, Uncertain0, Q),
     St#cq{q=#{}, restarted=true, uncertain=Uncertain};
 next_state(St=#cq{channels=Channels}, Ch, {call, _, cmd_channel_open, _}) ->
-    St#cq{channels=Channels#{Ch => #{consumer => none, confirms => false}}};
+    St#cq{channels=Channels#{Ch => #{consumer => none, confirms => false,
+                                     stalled_done => false}}};
 next_state(St=#cq{channels=Channels}, _, {call, _, cmd_channel_close, [Ch]}) ->
     St#cq{channels=maps:remove(Ch, Channels)};
 next_state(St=#cq{q=Q, unconfirmed=Unconfirmed, channels=Channels}, _, {call, _, cmd_channel_confirm_mode, [Ch]}) ->
@@ -409,6 +489,19 @@ next_state(St=#cq{channels=Channels}, Tag, {call, _, cmd_channel_consume, [_, Ch
 next_state(St=#cq{channels=Channels}, _, {call, _, cmd_channel_cancel, [_, Ch]}) ->
     ChInfo = maps:get(Ch, Channels),
     St#cq{channels=Channels#{Ch => ChInfo#{consumer => none}}};
+next_state(St=#cq{channels=Channels}, Tag, {call, _, cmd_channel_consume_stalled, [_, Ch]}) ->
+    ChInfo = maps:get(Ch, Channels),
+    St#cq{consumers=true, channels=Channels#{Ch => ChInfo#{consumer => {stalled, Tag}}}};
+next_state(St=#cq{channels=Channels}, _, {call, _, cmd_channel_await_timeout, [_, Ch]}) ->
+    ChInfo = maps:get(Ch, Channels),
+    St#cq{channels=Channels#{Ch => ChInfo#{consumer => none, stalled_done => true}}};
+%% Deliveries to a stalled consumer are timed out and requeued by the
+%% server, so receiving one client-side does not remove it from the
+%% queue, and settling it afterwards only settles its timed-out state.
+next_state(St, _, {call, _, cmd_channel_stall_receive, _}) ->
+    St;
+next_state(St, _, {call, _, cmd_channel_settle_stale, _}) ->
+    St;
 next_state(St, none, {call, _, cmd_channel_receive_and_ack, _}) ->
     St;
 next_state(St=#cq{q=Q, acked=Acked}, Msg, {call, _, cmd_channel_receive_and_ack, _}) ->
@@ -495,11 +588,22 @@ precondition(#cq{channels=Channels}, {call, _, Cmd, [_, Ch]}) when
     maps:get(consumer, maps:get(Ch, Channels)) =:= none;
 precondition(#cq{channels=Channels}, {call, _, Cmd, [_, Ch|_]}) when
         %% Only cancel/receive when we are already consuming on this channel.
+        %% Stalled consumers are excluded: their deliveries deliberately
+        %% remain pending and they end via cmd_channel_await_timeout.
         Cmd =:= cmd_channel_cancel; Cmd =:= cmd_channel_receive_and_ack;
         Cmd =:= cmd_channel_receive_and_requeue; Cmd =:= cmd_channel_receive_and_discard;
         Cmd =:= cmd_channel_receive_many_and_ack_ooo; Cmd =:= cmd_channel_receive_many_and_requeue_ooo;
         Cmd =:= cmd_channel_receive_many_and_discard_ooo ->
-    maps:get(consumer, maps:get(Ch, Channels)) =/= none;
+    is_active_consumer(maps:get(consumer, maps:get(Ch, Channels)));
+precondition(#cq{timeouts_enabled=TE, channels=Channels}, {call, _, cmd_channel_consume_stalled, [_, Ch]}) ->
+    TE andalso maps:get(consumer, maps:get(Ch, Channels)) =:= none;
+precondition(#cq{channels=Channels}, {call, _, cmd_channel_await_timeout, [_, Ch]}) ->
+    is_stalled(maps:get(consumer, maps:get(Ch, Channels)));
+precondition(#cq{channels=Channels}, {call, _, Cmd, [_, Ch|_]}) when
+        %% Only receive/settle stalled deliveries once the stalled
+        %% consumer was awaited, so that they have certainly timed out.
+        Cmd =:= cmd_channel_stall_receive; Cmd =:= cmd_channel_settle_stale ->
+    maps:get(stalled_done, maps:get(Ch, Channels), false);
 precondition(_, _) ->
     true.
 
@@ -537,6 +641,21 @@ postcondition(_, {call, _, cmd_channel_wait_for_confirms, _}, Res) ->
 postcondition(_, {call, _, cmd_channel_consume, _}, _) ->
     true;
 postcondition(_, {call, _, cmd_channel_cancel, _}, _) ->
+    true;
+postcondition(_, {call, _, cmd_channel_consume_stalled, _}, _) ->
+    true;
+postcondition(_, {call, _, cmd_channel_await_timeout, _}, Res) ->
+    Res =:= had_timeout orelse Res =:= no_timeout;
+postcondition(St, {call, _, cmd_channel_stall_receive, _}, Msgs) ->
+    %% The messages were requeued when they timed out and may have been
+    %% received and settled by another consumer since then.
+    lists:all(fun(Msg) ->
+        queue_has_msg(St, Msg) orelse
+        lists:member(Msg, St#cq.acked) orelse
+        lists:member(Msg, St#cq.received) orelse
+        lists:member(Msg, St#cq.uncertain)
+    end, Msgs);
+postcondition(_, {call, _, cmd_channel_settle_stale, _}, _) ->
     true;
 postcondition(St, {call, _, Cmd, Args}, empty) when
         Cmd =:= cmd_basic_get_msg; Cmd =:= cmd_channel_basic_get ->
@@ -706,6 +825,9 @@ cmd_teardown_queue(St=#cq{amq=AMQ, channels=Channels}) ->
     %% Then we can delete the queue.
     rabbit_amqqueue:delete(AMQ, false, false, <<"acting-user">>),
     rabbit_policy:delete(<<"/">>, <<"queue-version-policy">>, <<"acting-user">>),
+    %% Drop stalled consumer bookkeeping from the process dictionary.
+    _ = [erase(K) || {{stall_tag, _} = K, _} <- get()],
+    _ = [erase(K) || {{stale_dtags, _} = K, _} <- get()],
     ok.
 
 cmd_restart_vhost_clean(St=#cq{amq=AMQ0}) ->
@@ -976,6 +1098,143 @@ do_receive_requeue_all(Ch, Tag) ->
             do_receive_requeue_all(Ch, Tag)
     after 0 ->
         ok
+    end.
+
+cmd_channel_consume_stalled(St=#cq{amq=AMQ}, Ch) ->
+    ?DEBUG("~0p ~0p", [St, Ch]),
+    ok = amqp_selective_consumer:register_default_consumer(Ch, self()),
+    #resource{name = Name} = amqqueue:get_name(AMQ),
+    Tag = integer_to_binary(erlang:unique_integer([positive])),
+    #'basic.consume_ok'{} =
+        amqp_channel:call(Ch,
+                          #'basic.consume'{queue = Name, consumer_tag = Tag,
+                                           arguments = [{<<"x-consumer-timeout">>,
+                                                         long, ?STALL_TIMEOUT}]}),
+    receive #'basic.consume_ok'{consumer_tag = Tag} -> ok end,
+    %% The tag and received delivery tags are tracked outside the model
+    %% state because they are only needed by the commands themselves.
+    put({stall_tag, Ch}, Tag),
+    Tag.
+
+cmd_channel_await_timeout(St=#cq{channels=Channels}, Ch) ->
+    ?DEBUG("~0p ~0p", [St, Ch]),
+    #{consumer := {stalled, Tag}} = maps:get(Ch, Channels),
+    %% Every delivery made to the stalled consumer so far has timed out
+    %% (and its message was requeued) by the end of this sleep.
+    timer:sleep(4 * ?STALL_TIMEOUT),
+    receive
+        #'basic.cancel'{consumer_tag = Tag} ->
+            had_timeout
+    after 0 ->
+        %% No delivery has timed out, so the server never cancelled the
+        %% consumer. Cancel it now and requeue any deliveries in transit
+        %% so that their pending state does not time out later.
+        #'basic.cancel_ok'{} =
+            amqp_channel:call(Ch, #'basic.cancel'{consumer_tag = Tag}),
+        receive #'basic.cancel_ok'{consumer_tag = Tag} -> ok end,
+        do_receive_requeue_all(Ch, Tag),
+        no_timeout
+    end.
+
+cmd_channel_stall_receive(St, Ch) ->
+    ?DEBUG("~0p ~0p", [St, Ch]),
+    Tag = get({stall_tag, Ch}),
+    do_stall_receive(Ch, Tag, []).
+
+do_stall_receive(Ch, Tag, Msgs) ->
+    receive
+        {#'basic.deliver'{consumer_tag = Tag,
+                          delivery_tag = DeliveryTag}, Msg} ->
+            DTags = case get({stale_dtags, Ch}) of
+                undefined -> [];
+                L -> L
+            end,
+            ReceivedAt = erlang:monotonic_time(millisecond),
+            put({stale_dtags, Ch}, DTags ++ [{DeliveryTag, ReceivedAt}]),
+            do_stall_receive(Ch, Tag, [Msg|Msgs])
+    after 0 ->
+        lists:reverse(Msgs)
+    end.
+
+cmd_channel_settle_stale(St, Ch, N) ->
+    ?DEBUG("~0p ~0p ~0p", [St, Ch, N]),
+    case get({stale_dtags, Ch}) of
+        L when L =:= undefined; L =:= [] ->
+            none;
+        DTags ->
+            Entry = {DeliveryTag, ReceivedAt} =
+                lists:nth(1 + (N rem length(DTags)), DTags),
+            put({stale_dtags, Ch}, DTags -- [Entry]),
+            %% Wait until the delivery's consumer timeout has certainly
+            %% fired and been processed, so that this settlement is
+            %% always of a timed-out delivery, never of a live one.
+            Wait = ReceivedAt + 3 * ?STALL_TIMEOUT
+                   - erlang:monotonic_time(millisecond),
+            case Wait > 0 of
+                true -> timer:sleep(Wait);
+                false -> ok
+            end,
+            amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DeliveryTag}),
+            {settled, DeliveryTag}
+    end.
+
+%% After closing all channels, every message the model still considers
+%% queued must be obtainable from the queue: in-transit deliveries are
+%% requeued when their channel closes, and deliveries that timed out
+%% were requeued when the timeout fired. Messages with an expiration
+%% may have legitimately expired and are not required. A message that
+%% remains missing means it was lost, for example by a settlement of a
+%% timed-out delivery being misapplied to a live redelivery holding the
+%% same ack tag.
+cmd_drain_and_check(#cq{drain=false}) ->
+    true;
+cmd_drain_and_check(#cq{amq=undefined}) ->
+    true;
+cmd_drain_and_check(St=#cq{q=Q, channels=Channels}) ->
+    ?DEBUG("~0p", [St]),
+    _ = [try cmd_channel_close(Ch)
+         catch exit:{noproc, _} -> ok; exit:{shutdown, _} -> ok end
+        || Ch <- maps:keys(Channels)],
+    Expected = maps:fold(fun(_, ChQ, Acc0) ->
+        lists:foldl(fun
+            (Msg = #amqp_msg{props=#'P_basic'{expiration=undefined}}, Acc) ->
+                maps:update_with(Msg, fun(V) -> V + 1 end, 1, Acc);
+            (_ExpiringMsg, Acc) ->
+                Acc
+        end, Acc0, queue:to_list(ChQ))
+    end, #{}, Q),
+    do_drain_and_check(St, Expected, #{},
+                       erlang:monotonic_time(millisecond) + 5000).
+
+do_drain_and_check(St, Expected, Got, Deadline) ->
+    case cmd_basic_get_msg(St) of
+        empty ->
+            Missing = maps:fold(fun(Msg, Count, Acc) ->
+                case maps:get(Msg, Got, 0) of
+                    N when N >= Count -> Acc;
+                    N -> [{Msg, Count - N} | Acc]
+                end
+            end, [], Expected),
+            case Missing of
+                [] ->
+                    true;
+                _ ->
+                    case erlang:monotonic_time(millisecond) < Deadline of
+                        true ->
+                            %% Requeues triggered by the channels closing
+                            %% may not have been processed yet.
+                            timer:sleep(20),
+                            do_drain_and_check(St, Expected, Got, Deadline);
+                        false ->
+                            ?LOG_ERROR("Drain found messages missing from the queue: ~tp",
+                                       [Missing]),
+                            false
+                    end
+            end;
+        Msg ->
+            do_drain_and_check(St, Expected,
+                               maps:update_with(Msg, fun(V) -> V + 1 end, 1, Got),
+                               Deadline)
     end.
 
 do_encode_expiration(undefined) -> undefined;
