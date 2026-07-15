@@ -2786,7 +2786,7 @@ handle_consumer_timed_out(Timeout, ConsumerTag, MsgId, QName,
                           #ch{cfg = #conf{channel = Channel}} = State) ->
     ?LOG_WARNING("Consumer '~ts' on channel ~w and ~ts has timed out "
                  "waiting for a consumer acknowledgement of a delivery with
-                 message id of ~b. Timeout used: ~tp ms. "
+                 message id of ~tp. Timeout used: ~tp ms. "
                  "This timeout value can be configured, see consumers doc guide to learn more",
                  [ConsumerTag,
                   Channel,

@@ -49,7 +49,7 @@ get(_Config) ->
     Pid = spawn(?MODULE, function_for_process, []),
     Pid ! whatever,
     State = state(consumers([consumer(self(), <<"1">>), consumer(Pid, <<"2">>), consumer(self(), <<"3">>)])),
-    {Pid, {consumer, <<"2">>, _, _, _, _}} =
+    {Pid, {consumer, <<"2">>, _, _, _, _, _}} =
         rabbit_queue_consumers:get(Pid, <<"2">>, State),
     ?assertEqual(
         undefined,
@@ -65,7 +65,7 @@ get_consumer(_Config) ->
     Pid = spawn(unit_queue_consumers_SUITE, function_for_process, []),
     Pid ! whatever,
     State = state(consumers([consumer(self(), <<"1">>), consumer(Pid, <<"2">>), consumer(self(), <<"3">>)])),
-    {_Pid, {consumer, _, _, _, _, _}} =
+    {_Pid, {consumer, _, _, _, _, _, _}} =
         rabbit_queue_consumers:get_consumer(State),
     ?assertEqual(
         undefined,
@@ -149,12 +149,13 @@ list_consumers_sac_inactive_overrides_blocked(_Config) ->
     end.
 
 %% #cr field order: ch_pid, monitor_ref, acktags, consumer_count,
-%% blocked_consumers, limiter, unsent_message_count, link_states.
+%% blocked_consumers, limiter, unsent_message_count, link_states,
+%% timed_out_acks, timed_out_consumers.
 install_ch_record(ChPid, ConsumerEntries) ->
     BlockedQ = lists:foldl(fun (C, Acc) -> priority_queue:in(C, Acc) end,
                            priority_queue:new(), ConsumerEntries),
     CR = {cr, ChPid, undefined, queue:new(), length(ConsumerEntries),
-          BlockedQ, undefined, 0, #{}},
+          BlockedQ, undefined, 0, #{}, #{}, #{}},
     put({ch, ChPid}, CR),
     ok.
 
@@ -174,10 +175,10 @@ consumers([H | T], Q) ->
 
 
 consumer(Pid, ConsumerTag) ->
-    {Pid, {consumer, ConsumerTag, true, 1, [], <<"guest">>}}.
+    {Pid, {consumer, ConsumerTag, true, 1, [], <<"guest">>, 1_800_000}}.
 
 state(Consumers) ->
-    {state, Consumers, {}}.
+    {state, Consumers, {}, infinity}.
 
 function_for_process() ->
     receive

@@ -72,6 +72,7 @@
 -export([confirm_to_sender/3,
          send_rejection/3,
          deliver_to_consumer/5,
+         send_consumer_timeout/4,
          send_credit_reply/7]).
 
 -export([policy_apply_to_name/0,
@@ -308,6 +309,9 @@ consume(Q, Spec, State0) when ?amqqueue_is_classic(Q) ->
       args := Args,
       ok_msg := OkMsg,
       acting_user :=  ActingUser} = Spec,
+    %% The consumer timeout in the spec is ignored; the queue process
+    %% resolves it itself to keep the basic_consume call format unchanged
+    %% across mixed-version clusters.
     case delegate:invoke(QPid,
                          {gen_server2, call,
                           [{basic_consume, NoAck, ChPid, LimiterPid,
@@ -653,8 +657,10 @@ capabilities() ->
                           <<"x-max-length-bytes">>, <<"x-max-priority">>,
                           <<"x-overflow">>, <<"x-queue-mode">>, <<"x-queue-version">>,
                           <<"x-single-active-consumer">>, <<"x-queue-type">>,
-                          <<"x-queue-master-locator">>, <<"x-queue-leader-locator">>],
-      consumer_arguments => [<<"x-priority">>],
+                          <<"x-queue-master-locator">>, <<"x-queue-leader-locator">>,
+                          <<"x-consumer-timeout">>],
+      consumer_arguments => [<<"x-priority">>,
+                             <<"x-consumer-timeout">>],
       server_named => true,
       rebalance_module => undefined,
       can_redeliver => false,
@@ -729,6 +735,10 @@ send_rejection(Pid, QName, MsgSeqNo) ->
 
 deliver_to_consumer(Pid, QName, CTag, AckRequired, Message) ->
     Evt = {deliver, CTag, AckRequired, [Message]},
+    send_queue_event(Pid, QName, Evt).
+
+send_consumer_timeout(Pid, QName, CTag, AckTags) ->
+    Evt = {released, QName, CTag, AckTags, timeout},
     send_queue_event(Pid, QName, Evt).
 
 send_credit_reply(Pid, QName, Ctag, DeliveryCount, Credit, Avail, Drain) ->

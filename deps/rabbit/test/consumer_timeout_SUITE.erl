@@ -39,14 +39,17 @@ all() ->
     ].
 
 groups() ->
-    %% Consumer timeouts are only supported for quorum queues.
-    %% Classic queues and stream queues do not support consumer timeouts.
+    %% Consumer timeouts are supported for quorum and classic queues,
+    %% stream queues do not support consumer timeouts.
     AllTests = [consumer_timeout_with_basic_cancel_capability,
                 consumer_timeout_no_basic_cancel_capability,
-                consumer_timeout_basic_get],
+                consumer_timeout_basic_get,
+                consumer_timeout_redelivery_to_other_consumer],
 
     AllTestsParallel = [
-       {quorum_queue, [], AllTests}
+       {quorum_queue, [], AllTests},
+       {classic_queue, [], AllTests},
+       {classic_priority_queue, [], AllTests}
       ],
     [
      {global_consumer_timeout, [], AllTestsParallel},
@@ -94,6 +97,19 @@ init_per_group(quorum_queue, Config) ->
       Config,
       [{policy_type, <<"quorum_queues">>},
        {queue_args, [{<<"x-queue-type">>, longstr, <<"quorum">>}]},
+       {queue_durable, true}]);
+init_per_group(classic_queue, Config) ->
+    rabbit_ct_helpers:set_config(
+      Config,
+      [{policy_type, <<"classic_queues">>},
+       {queue_args, [{<<"x-queue-type">>, longstr, <<"classic">>}]},
+       {queue_durable, true}]);
+init_per_group(classic_priority_queue, Config) ->
+    rabbit_ct_helpers:set_config(
+      Config,
+      [{policy_type, <<"classic_queues">>},
+       {queue_args, [{<<"x-queue-type">>, longstr, <<"classic">>},
+                     {<<"x-max-priority">>, byte, 3}]},
        {queue_durable, true}]);
 init_per_group(Group, Config) ->
     case lists:member({group, Group}, all()) of
@@ -230,6 +246,54 @@ consumer_timeout_basic_get(Config) ->
     end,
     ok.
 
+
+%% Test that a message whose consumer timed out is requeued and redelivered
+%% to another consumer, while the timed out consumer no longer receives
+%% deliveries.
+consumer_timeout_redelivery_to_other_consumer(Config) ->
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    QName = ?config(queue_name, Config),
+    declare_queue(Ch, Config, QName),
+    amqp_channel:call(Ch, #'confirm.select'{}),
+    publish(Ch, QName, [<<"msg1">>]),
+    amqp_channel:wait_for_confirms_or_die(Ch, 30),
+    wait_for_messages(Config, [[QName, <<"1">>, <<"1">>, <<"0">>]]),
+    Ctag1 = <<"ctag1">>,
+    subscribe(Ch, QName, false, Ctag1),
+    receive
+        {#'basic.deliver'{consumer_tag = Ctag1,
+                          redelivered  = false}, _} ->
+            %% do nothing with the delivery, should trigger timeout
+            ok
+    after ?RECEIVE_TIMEOUT ->
+              flush(1),
+              exit(deliver_timeout)
+    end,
+    %% subscribe a second consumer on a separate channel that should
+    %% receive the requeued message once the first consumer times out
+    {ok, Ch2} = amqp_connection:open_channel(Conn),
+    Ctag2 = <<"ctag2">>,
+    subscribe(Ch2, QName, false, Ctag2),
+    DTag2 = receive
+                {#'basic.deliver'{delivery_tag = D,
+                                  consumer_tag = Ctag2,
+                                  redelivered  = true}, _} ->
+                    D
+            after ?RECEIVE_TIMEOUT ->
+                      flush(1),
+                      exit(redelivery_timeout)
+            end,
+    receive
+        #'basic.cancel'{consumer_tag = Ctag1} ->
+            ok
+    after ?RECEIVE_TIMEOUT ->
+              flush(1),
+              exit(basic_cancel_expected)
+    end,
+    amqp_channel:cast(Ch2, #'basic.ack'{delivery_tag = DTag2}),
+    wait_for_messages(Config, [[QName, <<"0">>, <<"0">>, <<"0">>]]),
+    rabbit_ct_client_helpers:close_connection(Conn),
+    ok.
 
 -define(CLIENT_CAPABILITIES,
     [{<<"publisher_confirms">>,           bool, true},

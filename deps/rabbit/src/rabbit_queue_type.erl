@@ -62,6 +62,7 @@
          arguments/1,
          arguments/2,
          notify_decorators/1,
+         default_consumer_timeout/0,
          publish_at_most_once/2,
          can_redeliver/2,
          rebalance_module/1,
@@ -948,24 +949,28 @@ get_consumer_timeout(_, Q) ->
     case rabbit_queue_type_util:args_policy_lookup(<<"consumer-timeout">>,
                                                    fun erlang:min/2, Q) of
         undefined ->
-            case application:get_env(rabbit, consumer_timeout) of
-                {ok, MS} when is_integer(MS) ->
-                    MS;
-                {ok, Other} ->
-                    %% Non-integer values (e.g. undefined) are not valid.
-                    %% Default to 24 hours.
-                    ?LOG_WARNING("consumer_timeout is set to an invalid value: ~tp, "
-                                 "defaulting to 86400000ms (24 hours)",
-                                 [Other]),
-                    86_400_000;
-                undefined ->
-                    %% The application default in rabbit.app is 1800000, so this
-                    %% branch is unreachable in practice unless explicitly configured.
-                    %% Default to 24 hours
-                    86_400_000
-            end;
+            default_consumer_timeout();
         Val when is_integer(Val) ->
             Val
+    end.
+
+-spec default_consumer_timeout() -> non_neg_integer().
+default_consumer_timeout() ->
+    case application:get_env(rabbit, consumer_timeout) of
+        {ok, MS} when is_integer(MS) ->
+            MS;
+        {ok, Other} ->
+            %% Non-integer values (e.g. undefined) are not valid.
+            %% Default to 24 hours.
+            ?LOG_WARNING("consumer_timeout is set to an invalid value: ~tp, "
+                         "defaulting to 86400000ms (24 hours)",
+                         [Other]),
+            86_400_000;
+        undefined ->
+            %% The application default in rabbit.app is 1800000, so this
+            %% branch is unreachable in practice unless explicitly configured.
+            %% Default to 24 hours
+            86_400_000
     end.
 
 check_cluster_queue_limit(Q) ->

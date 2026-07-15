@@ -185,6 +185,8 @@ groups() ->
        decimal_types,
        consumer_timeout_quorum_queue_policy,
        consumer_timeout_quorum_queue_consumer_arg,
+       consumer_timeout_classic_queue_policy,
+       consumer_timeout_classic_queue_consumer_arg,
        handle_in_use
       ]},
 
@@ -7247,15 +7249,29 @@ consumer_timeout_quorum_queue_policy(Config) ->
     ok = rabbit_ct_broker_helpers:set_policy(
            Config, 0, PolicyName, QName, <<"quorum_queues">>,
            [{<<"consumer-timeout">>, 1000}]),
-    ok = consumer_timeout(Config, QName, #{}),
+    ok = consumer_timeout(Config, QName, <<"quorum">>, #{}),
     ok = rabbit_ct_broker_helpers:clear_policy(Config, 0, PolicyName).
 
 consumer_timeout_quorum_queue_consumer_arg(Config) ->
     QName = atom_to_binary(?FUNCTION_NAME),
     LinkProperties = #{<<"rabbitmq:consumer-timeout">> => {uint, 1000}},
-    ok = consumer_timeout(Config, QName, LinkProperties).
+    ok = consumer_timeout(Config, QName, <<"quorum">>, LinkProperties).
 
-consumer_timeout(Config, QName, LinkProperties) ->
+consumer_timeout_classic_queue_policy(Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    PolicyName = <<"consumer timeout policy">>,
+    ok = rabbit_ct_broker_helpers:set_policy(
+           Config, 0, PolicyName, QName, <<"classic_queues">>,
+           [{<<"consumer-timeout">>, 1000}]),
+    ok = consumer_timeout(Config, QName, <<"classic">>, #{}),
+    ok = rabbit_ct_broker_helpers:clear_policy(Config, 0, PolicyName).
+
+consumer_timeout_classic_queue_consumer_arg(Config) ->
+    QName = atom_to_binary(?FUNCTION_NAME),
+    LinkProperties = #{<<"rabbitmq:consumer-timeout">> => {uint, 1000}},
+    ok = consumer_timeout(Config, QName, <<"classic">>, LinkProperties).
+
+consumer_timeout(Config, QName, QType, LinkProperties) ->
     Address = rabbitmq_amqp_address:queue(QName),
 
     OpnConf = connection_config(Config),
@@ -7264,9 +7280,9 @@ consumer_timeout(Config, QName, LinkProperties) ->
     {ok, LinkPair} = rabbitmq_amqp_client:attach_management_link_pair_sync(
                        Session, <<"mgmt link pair">>),
 
-    {ok, #{type := <<"quorum">>}} = rabbitmq_amqp_client:declare_queue(
-                                      LinkPair, QName,
-                                      #{arguments => #{<<"x-queue-type">> => {utf8, <<"quorum">>}}}),
+    {ok, #{type := QType}} = rabbitmq_amqp_client:declare_queue(
+                               LinkPair, QName,
+                               #{arguments => #{<<"x-queue-type">> => {utf8, QType}}}),
 
     {ok, Sender} = amqp10_client:attach_sender_link(Session, <<"sender">>, Address),
     wait_for_credit(Sender),
@@ -7315,8 +7331,13 @@ consumer_timeout(Config, QName, LinkProperties) ->
                 ?assertMatch(#{delivery_count := 0,
                                first_acquirer := false},
                              amqp10_msg:headers(M1Redelivered)),
-                ?assertMatch(#{<<"x-acquired-count">> := 1},
-                             amqp10_msg:message_annotations(M1Redelivered)),
+                case QType of
+                    <<"quorum">> ->
+                        ?assertMatch(#{<<"x-acquired-count">> := 1},
+                                     amqp10_msg:message_annotations(M1Redelivered));
+                    _ ->
+                        ok
+                end,
                 ok = amqp10_client:accept_msg(Receiver, M1Redelivered)
     after 9000 -> ct:fail({missing_msg, ?LINE})
     end,
@@ -7325,8 +7346,13 @@ consumer_timeout(Config, QName, LinkProperties) ->
                 ?assertMatch(#{delivery_count := 0,
                                first_acquirer := false},
                              amqp10_msg:headers(M2Redelivered)),
-                ?assertMatch(#{<<"x-acquired-count">> := 1},
-                             amqp10_msg:message_annotations(M2Redelivered)),
+                case QType of
+                    <<"quorum">> ->
+                        ?assertMatch(#{<<"x-acquired-count">> := 1},
+                                     amqp10_msg:message_annotations(M2Redelivered));
+                    _ ->
+                        ok
+                end,
                 ok = amqp10_client:accept_msg(Receiver, M2Redelivered)
     after 9000 -> ct:fail({missing_msg, ?LINE})
     end,
