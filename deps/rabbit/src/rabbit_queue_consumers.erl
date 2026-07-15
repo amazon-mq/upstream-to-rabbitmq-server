@@ -624,7 +624,7 @@ expire_ch_acks(Now, C = #cr{ch_pid = ChPid,
             C2 = C1#cr{acktags = ?QUEUE:from_list(lists:reverse(KeptRev)),
                        next_deadline = ChNext,
                        timed_out_acks = TimedOutAcks},
-            {C3, State2} = park_consumers(maps:to_list(ExpiredByCTag),
+            {C3, State2} = park_consumers(maps:keys(ExpiredByCTag),
                                           C2, State1),
             %% Credit the limiter right away: the expired deliveries are
             %% requeued and must not count against the channel's prefetch
@@ -682,21 +682,28 @@ release_reassigned(ExpiredByCTag, TimedOutAcks, C0, State0) ->
               end
       end, {C0, State0, []}, OldCTags).
 
-park_consumers(ExpiredByCTag, C, State) ->
-    lists:foldl(fun ({none, _Acks}, Acc) ->
+park_consumers(CTags, C, State) ->
+    lists:foldl(fun (none, Acc) ->
                         Acc;
-                    ({CTag, Acks}, {CN, StateN}) ->
-                        park_consumer(CTag, length(Acks), CN, StateN)
-                end, {C, State}, ExpiredByCTag).
+                    (CTag, {CN, StateN}) ->
+                        park_consumer(CTag, CN, StateN)
+                end, {C, State}, CTags).
 
-park_consumer(CTag, Pending, C = #cr{ch_pid = ChPid,
-                                     blocked_consumers = Blocked,
-                                     timed_out_consumers = TimedOutConsumers},
+park_consumer(CTag, C = #cr{ch_pid = ChPid,
+                            blocked_consumers = Blocked,
+                            timed_out_acks = TimedOutAcks,
+                            timed_out_consumers = TimedOutConsumers},
               State = #state{consumers = Consumers}) ->
+    %% The consumer resumes once all debts under its tag are settled,
+    %% including debts left over from a cancelled consumer that used
+    %% the same tag, so the count is derived from the debt ledger.
+    Pending = maps:fold(fun (_Ack, CT, N) when CT =:= CTag -> N + 1;
+                            (_Ack, _CT, N) -> N
+                        end, 0, TimedOutAcks),
     case maps:get(CTag, TimedOutConsumers, undefined) of
-        {Consumer, Pending0} ->
+        {Consumer, _Pending0} ->
             {C#cr{timed_out_consumers =
-                      TimedOutConsumers#{CTag := {Consumer, Pending0 + Pending}}},
+                      TimedOutConsumers#{CTag := {Consumer, Pending}}},
              State};
         undefined ->
             case get(ChPid, CTag, State) of
