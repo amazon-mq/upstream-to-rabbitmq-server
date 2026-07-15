@@ -9,7 +9,7 @@
 
 -export([new/0, max_active_priority/1, inactive/1, all/1, all/3, count/0,
          unacknowledged_message_count/0, add/10, remove/4, erase_ch/2,
-         deliver/5, record_ack/4, subtract_acks/3,
+         deliver/5, record_ack/5, subtract_acks/3, settle_released/3,
          possibly_unblock/3,
          resume_fun/0, notify_sent_fun/1, activate_limit_fun/0,
          drained/3, process_credit/5, get_link_state/2,
@@ -56,11 +56,17 @@
              %% Internal flow control for queue -> writer
              unsent_message_count :: non_neg_integer(),
              link_states :: #{rabbit_types:ctag() => #link_state{}},
-             %% Ack tags requeued on consumer timeout, awaiting settlement
-             timed_out_acks :: #{rabbit_types:ctag() | none => [ack()]},
+             %% Ack tags requeued on consumer timeout, awaiting settlement,
+             %% mapped to the consumer that held them when they timed out.
+             timed_out_acks :: #{ack() => rabbit_types:ctag() | none},
              %% Consumers withheld from deliveries until the client settles
-             %% all of their timed-out ack tags
-             timed_out_consumers :: #{rabbit_types:ctag() => consumer()}
+             %% all of their timed-out ack tags, together with the number of
+             %% such tags still outstanding.
+             timed_out_consumers :: #{rabbit_types:ctag() =>
+                                          {consumer(), pos_integer()}},
+             %% Earliest deadline among the entries in acktags; lets
+             %% expire_acks/2 skip channels with nothing due.
+             next_deadline = infinity :: deadline() | 'infinity'
             }).
 
 %%----------------------------------------------------------------------------
@@ -122,9 +128,8 @@ all(#state{consumers = Consumers}, SingleActiveConsumer, SingleActiveConsumerOn)
                 consumers(Consumers, SingleActiveConsumer, SingleActiveConsumerOn, []), all_ch_record()).
 
 timed_out_consumers(#cr{ch_pid = ChPid, timed_out_consumers = TimedOut}, Acc) ->
-    maps:fold(fun (CTag, #consumer{ack_required = Ack, prefetch = Prefetch,
-                                   args = Args, user = Username}, Acc1) ->
-                      [{ChPid, CTag, Ack, Prefetch, false, timed_out, Args, Username} | Acc1]
+    maps:fold(fun (_CTag, {Consumer, _Pending}, Acc1) ->
+                      [consumer_info(ChPid, Consumer, false, timed_out) | Acc1]
               end, Acc, TimedOut).
 
 consumers(Consumers, SingleActiveConsumer, SingleActiveConsumerOn, Acc) ->
@@ -149,11 +154,15 @@ consumers(Consumers, SingleActiveConsumer, SingleActiveConsumerOn, Acc) ->
                               end,
     priority_queue:fold(
       fun ({ChPid, Consumer}, _P, Acc1) ->
-              #consumer{tag = CTag, ack_required = Ack, prefetch = Prefetch,
-                        args = Args, user = Username} = Consumer,
               {Active, ActivityStatus} = ActiveActivityStatusFun({ChPid, Consumer}),
-              [{ChPid, CTag, Ack, Prefetch, Active, ActivityStatus, Args, Username} | Acc1]
+              [consumer_info(ChPid, Consumer, Active, ActivityStatus) | Acc1]
       end, Acc, Consumers).
+
+consumer_info(ChPid, #consumer{tag = CTag, ack_required = Ack,
+                               prefetch = Prefetch, args = Args,
+                               user = Username},
+              Active, ActivityStatus) ->
+    {ChPid, CTag, Ack, Prefetch, Active, ActivityStatus, Args, Username}.
 
 -spec count() -> non_neg_integer().
 
@@ -244,7 +253,10 @@ remove(ChPid, CTag, Reason, State = #state{consumers = Consumers}) ->
                                   limiter = Limiter2,
                                   blocked_consumers = remove_consumer(ChPid, CTag, Blocked),
                                   link_states = maps:remove(CTag, LinkStates),
-                                  timed_out_acks = maps:remove(CTag, TimedOutAcks),
+                                  timed_out_acks = maps:filter(
+                                                     fun (_Ack, CT) ->
+                                                             CT =/= CTag
+                                                     end, TimedOutAcks),
                                   timed_out_consumers = maps:remove(CTag, TimedOutConsumers)}),
             {Acks, State#state{consumers = remove_consumer(ChPid, CTag, Consumers)}}
     end.
@@ -264,7 +276,7 @@ erase_ch(ChPid, State = #state{consumers = Consumers}) ->
             All = priority_queue:join(Consumers, BlockedQ),
             ok = erase_ch_record(C),
             Filtered = priority_queue:filter(chan_pred(ChPid, true), All),
-            %% timed-out ack tags were requeued already and are not returned
+            %% Timed-out ack tags were requeued already and are not returned.
             {[AckTag || {AckTag, _CTag, _Deadline} <- ?QUEUE:to_list(ChAckTags)],
              tags(priority_queue:to_list(Filtered)) ++ maps:keys(TimedOutConsumers),
              State#state{consumers = remove_consumers(ChPid, Consumers)}}
@@ -373,7 +385,8 @@ deliver_to_consumer(FetchFun,
                               timeout      = Timeout},
                     C = #cr{ch_pid               = ChPid,
                             acktags              = ChAckTags,
-                            unsent_message_count = Count},
+                            unsent_message_count = Count,
+                            next_deadline        = Next},
                     QName) ->
     {{Message, IsDelivered, AckTag}, R} = FetchFun(AckRequired),
     Msg= {QName, self(), AckTag, IsDelivered, Message},
@@ -386,7 +399,8 @@ deliver_to_consumer(FetchFun,
             false -> {ChAckTags, infinity}
         end,
     update_ch_record(C#cr{acktags              = ChAckTags1,
-                          unsent_message_count = Count + 1}),
+                          unsent_message_count = Count + 1,
+                          next_deadline        = min(Deadline, Next)}),
     {Deadline, R}.
 
 update_next_deadline(Deadline, State = #state{next_deadline = Next}) ->
@@ -415,13 +429,16 @@ is_timed_out({ChPid, #consumer{tag = CTag}}) ->
             is_map_key(CTag, TimedOutConsumers)
     end.
 
--spec record_ack(ch(), pid(), ack(), deadline()) -> 'ok'.
+-spec record_ack(ch(), pid(), ack(), non_neg_integer(), state()) -> state().
 
-record_ack(ChPid, LimiterPid, AckTag, Deadline) ->
-    C = #cr{acktags = ChAckTags} = ch_record(ChPid, LimiterPid),
+record_ack(ChPid, LimiterPid, AckTag, Timeout, State) ->
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    C = #cr{acktags = ChAckTags,
+            next_deadline = Next} = ch_record(ChPid, LimiterPid),
     update_ch_record(
-      C#cr{acktags = ?QUEUE:in({AckTag, none, Deadline}, ChAckTags)}),
-    ok.
+      C#cr{acktags = ?QUEUE:in({AckTag, none, Deadline}, ChAckTags),
+           next_deadline = min(Deadline, Next)}),
+    update_next_deadline(Deadline, State).
 
 %% Returns the ack tags that are still known to the queue; the settlement
 %% of ack tags that timed out is recorded but they are not returned since
@@ -434,12 +451,20 @@ subtract_acks(ChPid, AckTags, State) ->
     case lookup_ch(ChPid) of
         not_found ->
             not_found;
-        C = #cr{acktags = ChAckTags, limiter = Lim} ->
-            {Matched, CTagCounts0, Unmatched, AckTags2} =
-                subtract_acks(AckTags, ChAckTags),
-            {CTagCounts, Resumed, C1} =
-                settle_timed_out(Unmatched, CTagCounts0,
-                                 C#cr{acktags = AckTags2}),
+        C = #cr{acktags = ChAckTags, limiter = Lim,
+                timed_out_acks = TimedOutAcks} ->
+            %% Tags matching live deliveries are settled against those;
+            %% the remainder falls back to the timed-out entries. AMQP
+            %% 0-9-1 channels settle timed-out tags via settle_released/3
+            %% instead, since a tag value is reused when a requeued
+            %% message is delivered again and only the channel knows
+            %% which of the two deliveries the client settled. The
+            %% limiter was credited for timed-out tags when they expired.
+            {Matched, CTagCounts, Unmatched, AckTags2} =
+                subtract_acks(lists:usort(AckTags), ChAckTags),
+            TimedOut = [Tag || Tag <- Unmatched,
+                               is_map_key(Tag, TimedOutAcks)],
+            {Resumed, C1} = settle_timed_out(TimedOut, C#cr{acktags = AckTags2}),
             {Unblocked, Lim2} =
                 maps:fold(
                   fun (CTag, Count, {UnblockedN, LimN}) ->
@@ -448,10 +473,7 @@ subtract_acks(ChPid, AckTags, State) ->
                           {UnblockedN orelse Unblocked1, LimN1}
                   end, {false, Lim}, CTagCounts),
             C2 = C1#cr{limiter = Lim2},
-            State1 = lists:foldl(fun (Entry, S = #state{consumers = Cons}) ->
-                                         S#state{consumers = add_consumer(Entry, Cons),
-                                                 use = update_use(S#state.use, active)}
-                                 end, State, Resumed),
+            State1 = resume_consumers(Resumed, State),
             case Unblocked of
                 true  -> case unblock(C2, State1) of
                              unchanged ->
@@ -463,6 +485,12 @@ subtract_acks(ChPid, AckTags, State) ->
                          {Matched, Resumed, State1}
             end
     end.
+
+resume_consumers(Resumed, State) ->
+    lists:foldl(fun (Entry, S = #state{consumers = Cons}) ->
+                        S#state{consumers = add_consumer(Entry, Cons),
+                                use = update_use(S#state.use, active)}
+                end, State, Resumed).
 
 subtract_acks(AckTags, AckQ) ->
     subtract_acks0(maps:from_keys(AckTags, true), [], [], maps:new(), AckQ).
@@ -487,65 +515,85 @@ subtract_acks0(Pending, Prefix, Matched, CTagCounts, AckQ) ->
              ?QUEUE:from_list(lists:reverse(Prefix))}
     end.
 
-settle_timed_out([], CTagCounts, C) ->
-    {CTagCounts, [], C};
-settle_timed_out(AckTags, CTagCounts0,
-                 C = #cr{ch_pid = ChPid,
-                         timed_out_acks = TimedOutAcks0,
-                         timed_out_consumers = TimedOutConsumers0}) ->
-    {CTagCounts, TimedOutAcks, Drained} =
-        lists:foldl(
-          fun (AckTag, {Counts, TOA, DrainedAcc}) ->
-                  case take_timed_out_ack(AckTag, maps:iterator(TOA)) of
-                      error ->
-                          {Counts, TOA, DrainedAcc};
-                      {CTag, []} ->
-                          {maps:update_with(CTag, fun (Old) -> Old + 1 end, 1, Counts),
-                           maps:remove(CTag, TOA), [CTag | DrainedAcc]};
-                      {CTag, Rem} ->
-                          {maps:update_with(CTag, fun (Old) -> Old + 1 end, 1, Counts),
-                           maps:update(CTag, Rem, TOA), DrainedAcc}
-                  end
-          end, {CTagCounts0, TimedOutAcks0, []}, AckTags),
-    {Resumed, TimedOutConsumers} =
-        lists:foldl(
-          fun (CTag, {Rs, TOC}) ->
-                  case maps:take(CTag, TOC) of
-                      {Consumer, TOC1} -> {[{ChPid, Consumer} | Rs], TOC1};
-                      error            -> {Rs, TOC}
-                  end
-          end, {[], TimedOutConsumers0}, Drained),
-    {CTagCounts, Resumed,
-     C#cr{timed_out_acks = TimedOutAcks,
-          timed_out_consumers = TimedOutConsumers}}.
+%% Settles deliveries that the queue released on consumer timeout. The
+%% messages were requeued when the timeout fired, so only the timed-out
+%% state is settled here, resuming the consumer once all of its released
+%% tags are settled. Tags no longer known (for example because the
+%% consumer was cancelled) are ignored.
+-spec settle_released(ch(), [ack()], state()) ->
+    'not_found' | {[{ch(), consumer()}], state()}.
 
-take_timed_out_ack(AckTag, Iter) ->
-    case maps:next(Iter) of
-        none ->
-            error;
-        {CTag, AckTags, Iter1} ->
-            case lists:member(AckTag, AckTags) of
-                true  -> {CTag, lists:delete(AckTag, AckTags)};
-                false -> take_timed_out_ack(AckTag, Iter1)
-            end
+settle_released(ChPid, AckTags, State) ->
+    case lookup_ch(ChPid) of
+        not_found ->
+            not_found;
+        C = #cr{timed_out_acks = TimedOutAcks} ->
+            Tags = [Tag || Tag <- lists:usort(AckTags),
+                           is_map_key(Tag, TimedOutAcks)],
+            {Resumed, C1} = settle_timed_out(Tags, C),
+            update_ch_record(C1),
+            {Resumed, resume_consumers(Resumed, State)}
+    end.
+
+settle_timed_out([], C) ->
+    {[], C};
+settle_timed_out(AckTags, C = #cr{ch_pid = ChPid,
+                                  timed_out_acks = TimedOutAcks0,
+                                  timed_out_consumers = TimedOutConsumers0}) ->
+    {TimedOutAcks, TimedOutConsumers, Resumed} =
+        lists:foldl(
+          fun (AckTag, {TOA0, TOC0, Rs}) ->
+                  {CTag, TOA} = maps:take(AckTag, TOA0),
+                  case release_timed_out_consumer(CTag, TOC0) of
+                      {resumed, Consumer, TOC} ->
+                          {TOA, TOC, [{ChPid, Consumer} | Rs]};
+                      {kept, TOC} ->
+                          {TOA, TOC, Rs}
+                  end
+          end, {TimedOutAcks0, TimedOutConsumers0, []}, AckTags),
+    {Resumed, C#cr{timed_out_acks = TimedOutAcks,
+                   timed_out_consumers = TimedOutConsumers}}.
+
+release_timed_out_consumer(none, TOC) ->
+    %% Timed-out basic.get deliveries do not park a consumer.
+    {kept, TOC};
+release_timed_out_consumer(CTag, TOC) ->
+    case maps:get(CTag, TOC, undefined) of
+        undefined ->
+            %% The consumer was cancelled while it was parked.
+            {kept, TOC};
+        {Consumer, 1} ->
+            {resumed, Consumer, maps:remove(CTag, TOC)};
+        {Consumer, Pending} ->
+            {kept, TOC#{CTag := {Consumer, Pending - 1}}}
     end.
 
 %% Removes all ack tags whose deadline has passed, withholding the affected
 %% consumers from further deliveries until the client settles those tags.
-%% The caller is responsible for requeueing the expired ack tags.
+%% The prefetch limiter is credited right away since the messages return to
+%% the queue; the caller is responsible for requeueing the expired ack tags
+%% and for running the message queue for the returned unblocked consumers.
 -spec expire_acks(integer(), state()) ->
     {[{ch(), rabbit_types:ctag() | none, [ack()]}],
-     deadline() | 'infinity', state()}.
+     [{ch(), consumer()}], state()}.
 
 expire_acks(Now, State) ->
-    lists:foldl(fun (C, Acc) -> expire_ch_acks(Now, C, Acc) end,
-                {[], infinity, State}, all_ch_record()).
+    {Expired, Unblocked, NextDeadline, State1} =
+        lists:foldl(fun (C, Acc) -> expire_ch_acks(Now, C, Acc) end,
+                    {[], [], infinity, State}, all_ch_record()),
+    {Expired, Unblocked, update_next_deadline(NextDeadline, State1)}.
 
+expire_ch_acks(Now, #cr{next_deadline = ChNext},
+               {Expired, Unblocked, NextDeadline, State})
+  when ChNext > Now ->
+    %% Nothing in this channel is due yet.
+    {Expired, Unblocked, min(ChNext, NextDeadline), State};
 expire_ch_acks(Now, C = #cr{ch_pid = ChPid,
                             acktags = ChAckTags,
-                            timed_out_acks = TimedOutAcks},
-               {Expired0, NextDeadline0, State0}) ->
-    {KeptRev, ExpiredByCTag, NextDeadline} =
+                            limiter = Limiter0,
+                            timed_out_acks = TimedOutAcks0},
+               {Expired0, Unblocked0, NextDeadline0, State0}) ->
+    {KeptRev, ExpiredByCTag, ChNext} =
         lists:foldl(
           fun ({_AckTag, _CTag, Deadline} = E, {Kept, Exp, Next})
                 when Deadline > Now ->
@@ -555,39 +603,106 @@ expire_ch_acks(Now, C = #cr{ch_pid = ChPid,
                    maps:update_with(CTag, fun (Acks) -> [AckTag | Acks] end,
                                     [AckTag], Exp),
                    Next}
-          end, {[], #{}, NextDeadline0}, ?QUEUE:to_list(ChAckTags)),
+          end, {[], #{}, infinity}, ?QUEUE:to_list(ChAckTags)),
     case map_size(ExpiredByCTag) of
         0 ->
-            {Expired0, NextDeadline, State0};
+            update_ch_record(C#cr{next_deadline = ChNext}),
+            {Expired0, Unblocked0, min(ChNext, NextDeadline0), State0};
         _ ->
-            C1 = C#cr{acktags = ?QUEUE:from_list(lists:reverse(KeptRev)),
-                      timed_out_acks =
-                          maps:merge_with(fun (_, Old, New) -> New ++ Old end,
-                                          TimedOutAcks, ExpiredByCTag)},
-            {C2, State} = park_consumers(maps:keys(ExpiredByCTag), C1, State0),
-            update_ch_record(C2),
+            %% An expiring tag value may already be recorded as timed out
+            %% for an earlier delivery. Only one settlement can ever
+            %% arrive for the tag, so the earlier owner's entry is
+            %% released before the tag is reassigned.
+            {C1, State1, ResumedOld} =
+                release_reassigned(ExpiredByCTag, TimedOutAcks0, C, State0),
+            TimedOutAcks =
+                maps:fold(fun (CTag, Acks, TOA) ->
+                                  lists:foldl(fun (Ack, TOA1) ->
+                                                      TOA1#{Ack => CTag}
+                                              end, TOA, Acks)
+                          end, TimedOutAcks0, ExpiredByCTag),
+            C2 = C1#cr{acktags = ?QUEUE:from_list(lists:reverse(KeptRev)),
+                       next_deadline = ChNext,
+                       timed_out_acks = TimedOutAcks},
+            {C3, State2} = park_consumers(maps:to_list(ExpiredByCTag),
+                                          C2, State1),
+            %% Credit the limiter right away: the expired deliveries are
+            %% requeued and must not count against the channel's prefetch
+            %% while the consumer is parked.
+            {UnblockedLim, Limiter} =
+                maps:fold(fun (CTag, Acks, {U, L}) ->
+                                  {U1, L1} = rabbit_limiter:ack_from_queue(
+                                               L, CTag, length(Acks)),
+                                  {U orelse U1, L1}
+                          end, {false, Limiter0}, ExpiredByCTag),
+            C4 = C3#cr{limiter = Limiter},
             Expired = maps:fold(fun (CTag, Acks, Acc) ->
                                         [{ChPid, CTag, lists:sort(Acks)} | Acc]
                                 end, Expired0, ExpiredByCTag),
-            {Expired, NextDeadline, State}
+            {Unblocked, State} =
+                case UnblockedLim of
+                    true ->
+                        case unblock(C4, State2) of
+                            unchanged ->
+                                {[], State2};
+                            {unblocked, UnblockedConsumers, State3} ->
+                                {UnblockedConsumers, State3}
+                        end;
+                    false ->
+                        update_ch_record(C4),
+                        {[], State2}
+                end,
+            {Expired, ResumedOld ++ Unblocked ++ Unblocked0,
+             min(ChNext, NextDeadline0), State}
     end.
 
-park_consumers(CTags, C, State) ->
-    lists:foldl(fun (none, Acc)  -> Acc;
-                    (CTag, {CN, StateN}) -> park_consumer(CTag, CN, StateN)
-                end, {C, State}, CTags).
+release_reassigned(ExpiredByCTag, TimedOutAcks, C0, State0) ->
+    OldCTags = maps:fold(
+                 fun (_CTag, Acks, Acc) ->
+                         lists:foldl(fun (Ack, Acc1) ->
+                                             case TimedOutAcks of
+                                                 #{Ack := OldCTag} ->
+                                                     [OldCTag | Acc1];
+                                                 _ ->
+                                                     Acc1
+                                             end
+                                     end, Acc, Acks)
+                 end, [], ExpiredByCTag),
+    lists:foldl(
+      fun (OldCTag, {C = #cr{ch_pid = ChPid,
+                             timed_out_consumers = TOC}, State, Resumed}) ->
+              case release_timed_out_consumer(OldCTag, TOC) of
+                  {resumed, Consumer, TOC1} ->
+                      Entry = {ChPid, Consumer},
+                      {C#cr{timed_out_consumers = TOC1},
+                       resume_consumers([Entry], State),
+                       [Entry | Resumed]};
+                  {kept, TOC1} ->
+                      {C#cr{timed_out_consumers = TOC1}, State, Resumed}
+              end
+      end, {C0, State0, []}, OldCTags).
 
-park_consumer(CTag, C = #cr{ch_pid = ChPid,
-                            blocked_consumers = Blocked,
-                            timed_out_consumers = TimedOutConsumers},
+park_consumers(ExpiredByCTag, C, State) ->
+    lists:foldl(fun ({none, _Acks}, Acc) ->
+                        Acc;
+                    ({CTag, Acks}, {CN, StateN}) ->
+                        park_consumer(CTag, length(Acks), CN, StateN)
+                end, {C, State}, ExpiredByCTag).
+
+park_consumer(CTag, Pending, C = #cr{ch_pid = ChPid,
+                                     blocked_consumers = Blocked,
+                                     timed_out_consumers = TimedOutConsumers},
               State = #state{consumers = Consumers}) ->
-    case is_map_key(CTag, TimedOutConsumers) of
-        true ->
-            {C, State};
-        false ->
+    case maps:get(CTag, TimedOutConsumers, undefined) of
+        {Consumer, Pending0} ->
+            {C#cr{timed_out_consumers =
+                      TimedOutConsumers#{CTag := {Consumer, Pending0 + Pending}}},
+             State};
+        undefined ->
             case get(ChPid, CTag, State) of
                 {_ChPid, Consumer} ->
-                    {C#cr{timed_out_consumers = TimedOutConsumers#{CTag => Consumer}},
+                    {C#cr{timed_out_consumers =
+                              TimedOutConsumers#{CTag => {Consumer, Pending}}},
                      State#state{consumers = remove_consumer(ChPid, CTag, Consumers)}};
                 undefined ->
                     Pred = fun ({_P, {CP, #consumer{tag = CT}}}) ->
@@ -596,9 +711,12 @@ park_consumer(CTag, C = #cr{ch_pid = ChPid,
                     case lists:search(Pred, priority_queue:to_list(Blocked)) of
                         {value, {_P, {_ChPid, Consumer}}} ->
                             {C#cr{blocked_consumers = remove_consumer(ChPid, CTag, Blocked),
-                                  timed_out_consumers = TimedOutConsumers#{CTag => Consumer}},
+                                  timed_out_consumers =
+                                      TimedOutConsumers#{CTag => {Consumer, Pending}}},
                              State};
                         false ->
+                            %% The consumer was cancelled with its acks kept;
+                            %% the tags remain settleable via timed_out_acks.
                             {C, State}
                     end
             end

@@ -124,7 +124,11 @@
                       %% queue name
                       queue,
                       %% message ID used by queue and message store implementations
-                      msg_id
+                      msg_id,
+                      %% Whether the queue released the delivery after a
+                      %% consumer timeout; released deliveries were requeued
+                      %% and no longer count against the channel prefetch.
+                      released = false :: boolean()
                     }).
 
 -record(direct_reply, {
@@ -1486,6 +1490,8 @@ handle_method(#'basic.recover_async'{requeue = true},
     OkFun = fun () -> ok end,
     UAMQL = ?QUEUE:to_list(UAMQ),
 
+    {Released, Live} = partition_released(UAMQL),
+    {QueueStates1, Actions1} = settle_released_acks(Released, QueueStates0),
     {QueueStates, Actions} =
         foreach_per_queue(
           fun ({QRef, CTag}, MsgIds, {Acc0, Actions0}) ->
@@ -1496,7 +1502,7 @@ handle_method(#'basic.recover_async'{requeue = true},
                                                QRef, requeue, CTag, MsgIds, Acc0),
                             {Acc, Act ++ Actions0}
                     end)
-          end, lists:reverse(UAMQL), {QueueStates0, []}),
+          end, lists:reverse(Live), {QueueStates1, Actions1}),
     ok = notify_limiter(Limiter, UAMQL),
     State1 = handle_queue_actions(Actions, State#ch{unacked_message_q = ?QUEUE:new(),
                                                     queue_states = QueueStates}),
@@ -1905,6 +1911,8 @@ reject(DeliveryTag, Op, Multiple,
 %% NB: Acked is in youngest-first order
 internal_reject(Op, Acked, Limiter,
                 State = #ch{queue_states = QueueStates0}) ->
+    {Released, Live} = partition_released(Acked),
+    {QueueStates1, Actions1} = settle_released_acks(Released, QueueStates0),
     {QueueStates, Actions} =
         foreach_per_queue(
           fun({QRef, CTag}, MsgIds, {Acc0, Actions0}) ->
@@ -1914,9 +1922,31 @@ internal_reject(Op, Acked, Limiter,
                       {protocol_error, ErrorType, Reason, ReasonArgs} ->
                           rabbit_misc:protocol_error(ErrorType, Reason, ReasonArgs)
                   end
-          end, Acked, {QueueStates0, []}),
+          end, Live, {QueueStates1, Actions1}),
     ok = notify_limiter(Limiter, Acked),
     {State#ch{queue_states = QueueStates}, Actions}.
+
+%% Client settlements of deliveries that the queue released on consumer
+%% timeout carry their own settle operation regardless of what the client
+%% did: the messages were requeued when the timeout fired, so only the
+%% timed-out state is settled at the queue.
+partition_released(Acked) ->
+    lists:partition(fun (#pending_ack{released = Released}) -> Released end,
+                    Acked).
+
+settle_released_acks([], QueueStates) ->
+    {QueueStates, []};
+settle_released_acks(Released, QueueStates0) ->
+    foreach_per_queue(
+      fun ({QRef, CTag}, MsgIds, {Acc0, Actions0}) ->
+              case rabbit_queue_type:settle(QRef, released, CTag,
+                                            MsgIds, Acc0) of
+                  {ok, Acc, Actions} ->
+                      {Acc, Actions0 ++ Actions};
+                  {protocol_error, ErrorType, Reason, ReasonArgs} ->
+                      rabbit_misc:protocol_error(ErrorType, Reason, ReasonArgs)
+              end
+      end, Released, {QueueStates0, []}).
 
 record_sent(Type, QueueType, Tag, AckRequired,
             Msg = {QName, _QPid, MsgId, Redelivered, _Message},
@@ -2012,6 +2042,8 @@ collect_acks(AcknowledgedAcc, RemainingAcc, UAMQ, DeliveryTag, Multiple) ->
 %% Settles (acknowledges) messages at the queue replica process level.
 %% This happens in the oldest-first order (ascending by delivery tag).
 settle_acks(Acks, State = #ch{queue_states = QueueStates0}) ->
+    {Released, Live} = partition_released(Acks),
+    {QueueStates1, ActionsAcc1} = settle_released_acks(Released, QueueStates0),
     {QueueStates, Actions} =
         foreach_per_queue(
           fun ({QRef, CTag}, MsgIds, {Acc0, ActionsAcc0}) ->
@@ -2023,7 +2055,7 @@ settle_acks(Acks, State = #ch{queue_states = QueueStates0}) ->
                       {protocol_error, ErrorType, Reason, ReasonArgs} ->
                           rabbit_misc:protocol_error(ErrorType, Reason, ReasonArgs)
                   end
-          end, Acks, {QueueStates0, []}),
+          end, Live, {QueueStates1, ActionsAcc1}),
     ok = notify_limiter(State#ch.limiter, Acks),
     {State#ch{queue_states = QueueStates}, Actions}.
 
@@ -2099,11 +2131,58 @@ notify_limiter(Limiter, Acked) ->
                                           %% Quorum queues do not interact
                                           %% with limiters
                                           Acc;
+                                      (#pending_ack{released = true}, Acc) ->
+                                          %% The limiter was already told when
+                                          %% the queue released the delivery.
+                                          Acc;
                                       (_, Acc) -> Acc + 1
                                   end, 0, Acked) of
                      0     -> ok;
                      Count -> rabbit_limiter:ack(Limiter, Count)
                  end
+    end.
+
+%% Marks the unacked entries of deliveries that a classic queue released
+%% on consumer timeout. The queue requeued the messages, so a late client
+%% settlement must only settle the timed-out state (see
+%% partition_released/1): the released tag value may have been reused for
+%% a redelivery of the message on this same channel, and a settlement
+%% resolved against the redelivery would lose it. The released deliveries
+%% also no longer count against a channel-wide (global) prefetch,
+%% otherwise a stalled consumer starves every other consumer on the
+%% channel. Quorum queue message ids are never reused and quorum queues
+%% do not interact with the limiter, so their entries are left alone.
+mark_released(QName, CTag, MsgIds,
+              State = #ch{limiter = Limiter,
+                          unacked_message_q = UAMQ0,
+                          queue_states = QueueStates}) ->
+    case rabbit_queue_type:module(QName, QueueStates) of
+        {ok, rabbit_classic_queue} ->
+            MsgIdSet = maps:from_keys(MsgIds, true),
+            {Entries, Count} =
+                lists:mapfoldl(
+                  fun (PA = #pending_ack{queue = Q, tag = T, msg_id = MsgId,
+                                         released = false}, N)
+                        when Q =:= QName andalso T =:= CTag ->
+                          case is_map_key(MsgId, MsgIdSet) of
+                              true  -> {PA#pending_ack{released = true}, N + 1};
+                              false -> {PA, N}
+                          end;
+                      (PA, N) ->
+                          {PA, N}
+                  end, 0, ?QUEUE:to_list(UAMQ0)),
+            case Count of
+                0 ->
+                    State;
+                _ ->
+                    case rabbit_limiter:is_active(Limiter) of
+                        true  -> ok = rabbit_limiter:ack(Limiter, Count);
+                        false -> ok
+                    end,
+                    State#ch{unacked_message_q = ?QUEUE:from_list(Entries)}
+            end;
+        _ ->
+            State
     end.
 
 deliver_to_queues({Message, _Options, _RoutedToQueues} = Delivery,
@@ -2823,7 +2902,7 @@ handle_queue_actions(Actions, State) ->
                   true ->
                       ok = send(#'basic.cancel'{consumer_tag = CTag,
                                                 nowait = true}, S0),
-                      S0;
+                      mark_released(QRef, CTag, MsgSeqNos, S0);
                   false ->
                       %% fallback
                       {_, S} = handle_consumer_timed_out(-1, CTag, hd(MsgSeqNos),

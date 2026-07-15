@@ -153,6 +153,9 @@
 -type settle_op() :: complete |
                      requeue |
                      discard |
+                     %% Settlement of a delivery that the queue released
+                     %% on consumer timeout; only used with classic queues.
+                     released |
                      {modify,
                       DeliveryFailed :: boolean(),
                       UndeliverableHere :: boolean(),

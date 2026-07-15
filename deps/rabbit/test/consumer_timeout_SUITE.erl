@@ -39,12 +39,14 @@ all() ->
     ].
 
 groups() ->
-    %% Consumer timeouts are supported for quorum and classic queues,
-    %% stream queues do not support consumer timeouts.
+    %% Consumer timeouts are supported for quorum and classic queues.
+    %% Stream queues do not support consumer timeouts.
     AllTests = [consumer_timeout_with_basic_cancel_capability,
                 consumer_timeout_no_basic_cancel_capability,
                 consumer_timeout_basic_get,
-                consumer_timeout_redelivery_to_other_consumer],
+                consumer_timeout_redelivery_to_other_consumer,
+                consumer_timeout_stale_ack_after_redelivery,
+                consumer_timeout_global_qos],
 
     AllTestsParallel = [
        {quorum_queue, [], AllTests},
@@ -75,7 +77,11 @@ init_per_suite(Config0) ->
                           {rmq_nodes_count, ClusterSize}]),
     Config3 = rabbit_ct_helpers:merge_app_env(
                 Config2, {rabbit, [{channel_tick_interval, 256},
-                                   {quorum_tick_interval, 256}]}),
+                                   {quorum_tick_interval, 256},
+                                   %% consumer_timeout_global_qos requires
+                                   %% the deprecated global QoS feature
+                                   {permit_deprecated_features,
+                                    #{global_qos => true}}]}),
     Config4 = rabbit_ct_helpers:run_steps(Config3,
                                 rabbit_ct_broker_helpers:setup_steps() ++
                                 rabbit_ct_client_helpers:setup_steps()),
@@ -263,14 +269,14 @@ consumer_timeout_redelivery_to_other_consumer(Config) ->
     receive
         {#'basic.deliver'{consumer_tag = Ctag1,
                           redelivered  = false}, _} ->
-            %% do nothing with the delivery, should trigger timeout
+            %% Do nothing with the delivery to trigger the timeout.
             ok
     after ?RECEIVE_TIMEOUT ->
               flush(1),
               exit(deliver_timeout)
     end,
-    %% subscribe a second consumer on a separate channel that should
-    %% receive the requeued message once the first consumer times out
+    %% Subscribe a second consumer on a separate channel that should
+    %% receive the requeued message once the first consumer times out.
     {ok, Ch2} = amqp_connection:open_channel(Conn),
     Ctag2 = <<"ctag2">>,
     subscribe(Ch2, QName, false, Ctag2),
@@ -291,6 +297,137 @@ consumer_timeout_redelivery_to_other_consumer(Config) ->
               exit(basic_cancel_expected)
     end,
     amqp_channel:cast(Ch2, #'basic.ack'{delivery_tag = DTag2}),
+    wait_for_messages(Config, [[QName, <<"0">>, <<"0">>, <<"0">>]]),
+    rabbit_ct_client_helpers:close_connection(Conn),
+    ok.
+
+%% Test that a late acknowledgement of a timed-out delivery does not settle
+%% the redelivery of the same message: classic queue ack tags are reused
+%% when a requeued message is delivered again on the same channel, and a
+%% settlement that resolved to the wrong delivery would lose the message.
+consumer_timeout_stale_ack_after_redelivery(Config) ->
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    QName = ?config(queue_name, Config),
+    declare_queue(Ch, Config, QName),
+    amqp_channel:call(Ch, #'confirm.select'{}),
+    publish(Ch, QName, [<<"msg1">>]),
+    amqp_channel:wait_for_confirms_or_die(Ch, 30),
+    wait_for_messages(Config, [[QName, <<"1">>, <<"1">>, <<"0">>]]),
+    Ctag1 = <<"ctag1">>,
+    subscribe(Ch, QName, false, Ctag1),
+    DTag1 = receive
+                {#'basic.deliver'{delivery_tag = D1,
+                                  consumer_tag = Ctag1,
+                                  redelivered  = false}, _} ->
+                    %% Do nothing with the delivery to trigger the timeout.
+                    D1
+            after ?RECEIVE_TIMEOUT ->
+                      flush(1),
+                      exit(deliver_timeout)
+            end,
+    %% A second consumer on the same channel is redelivered the requeued
+    %% message, possibly under the same ack tag the queue used for the
+    %% first delivery.
+    Ctag2 = <<"ctag2">>,
+    subscribe(Ch, QName, false, Ctag2),
+    DTag2 = receive
+                {#'basic.deliver'{delivery_tag = D2,
+                                  consumer_tag = Ctag2,
+                                  redelivered  = true}, _} ->
+                    D2
+            after ?RECEIVE_TIMEOUT ->
+                      flush(1),
+                      exit(redelivery_timeout)
+            end,
+    receive
+        #'basic.cancel'{consumer_tag = Ctag1} ->
+            ok
+    after ?RECEIVE_TIMEOUT ->
+              flush(1),
+              exit(basic_cancel_expected)
+    end,
+    %% The late settlement of the timed-out delivery must not settle the
+    %% redelivery that the second consumer is still processing.
+    amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DTag1}),
+    %% Requeueing the redelivery must therefore bring the message back.
+    amqp_channel:cast(Ch, #'basic.nack'{delivery_tag = DTag2,
+                                        requeue = true}),
+    DTag3 = receive
+                {#'basic.deliver'{delivery_tag = D3,
+                                  redelivered  = true}, _} ->
+                    D3
+            after ?RECEIVE_TIMEOUT ->
+                      flush(1),
+                      exit(stale_ack_settled_redelivery)
+            end,
+    amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DTag3}),
+    wait_for_messages(Config, [[QName, <<"0">>, <<"0">>, <<"0">>]]),
+    rabbit_ct_client_helpers:close_connection(Conn),
+    ok.
+
+%% Test that messages requeued by the consumer timeout no longer count
+%% against a channel-wide (global) prefetch limit; other consumers on the
+%% channel must keep receiving deliveries after one consumer stalls.
+consumer_timeout_global_qos(Config) ->
+    case ?config(policy_type, Config) of
+        <<"quorum_queues">> ->
+            {skip, "global QoS is not supported by quorum queues"};
+        _ ->
+            consumer_timeout_global_qos0(Config)
+    end.
+
+consumer_timeout_global_qos0(Config) ->
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    QName = ?config(queue_name, Config),
+    declare_queue(Ch, Config, QName),
+    amqp_channel:call(Ch, #'confirm.select'{}),
+    publish(Ch, QName, [<<"msg1">>, <<"msg2">>]),
+    amqp_channel:wait_for_confirms_or_die(Ch, 30),
+    wait_for_messages(Config, [[QName, <<"2">>, <<"2">>, <<"0">>]]),
+    #'basic.qos_ok'{} = amqp_channel:call(
+                          Ch, #'basic.qos'{prefetch_count = 1,
+                                           global = true}),
+    Ctag1 = <<"ctag1">>,
+    subscribe(Ch, QName, false, Ctag1),
+    receive
+        {#'basic.deliver'{consumer_tag = Ctag1,
+                          redelivered  = false}, _} ->
+            %% Do nothing with the delivery to trigger the timeout.
+            ok
+    after ?RECEIVE_TIMEOUT ->
+              flush(1),
+              exit(deliver_timeout)
+    end,
+    %% The channel-wide prefetch of 1 is exhausted by the stalled consumer,
+    %% so the second consumer receives nothing until the timeout fires and
+    %% the prefetch slot is given back.
+    Ctag2 = <<"ctag2">>,
+    subscribe(Ch, QName, false, Ctag2),
+    receive
+        {#'basic.deliver'{consumer_tag = Ctag2}, _} = Early ->
+            flush(1),
+            exit({unexpected_delivery_before_timeout, Early})
+    after 500 ->
+              ok
+    end,
+    DTagA = receive
+                {#'basic.deliver'{delivery_tag = DA,
+                                  consumer_tag = Ctag2}, _} ->
+                    DA
+            after ?RECEIVE_TIMEOUT ->
+                      flush(1),
+                      exit(prefetch_slot_not_returned)
+            end,
+    amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DTagA}),
+    DTagB = receive
+                {#'basic.deliver'{delivery_tag = DB,
+                                  consumer_tag = Ctag2}, _} ->
+                    DB
+            after ?RECEIVE_TIMEOUT ->
+                      flush(1),
+                      exit(second_message_missing)
+            end,
+    amqp_channel:cast(Ch, #'basic.ack'{delivery_tag = DTagB}),
     wait_for_messages(Config, [[QName, <<"0">>, <<"0">>, <<"0">>]]),
     rabbit_ct_client_helpers:close_connection(Conn),
     ok.

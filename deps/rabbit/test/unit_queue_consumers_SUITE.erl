@@ -19,7 +19,11 @@ all() ->
         list_consumers,
         list_consumers_reports_blocked,
         list_consumers_sac_active_overrides_blocked,
-        list_consumers_sac_inactive_overrides_blocked
+        list_consumers_sac_inactive_overrides_blocked,
+        expire_acks_parks_consumer,
+        expire_acks_reassigns_reused_tag,
+        settle_released_targets_timed_out_entry,
+        settle_resumes_parked_consumer
     ].
 
 is_same(_Config) ->
@@ -148,14 +152,135 @@ list_consumers_sac_inactive_overrides_blocked(_Config) ->
         uninstall_ch_record(ChPid)
     end.
 
+%% Expiring a delivery whose deadline has passed reports it, parks the
+%% consumer and keeps deliveries with future deadlines tracked.
+expire_acks_parks_consumer(_Config) ->
+    ChPid = self(),
+    Now = erlang:monotonic_time(millisecond),
+    Entry = consumer(ChPid, <<"ctag1">>),
+    AckTags = lqueue:in({2, <<"ctag1">>, Now + 60_000},
+                        lqueue:in({1, <<"ctag1">>, Now - 1}, lqueue:new())),
+    install_ch_record(ChPid, [], #{acktags => AckTags,
+                                   next_deadline => Now - 1}),
+    try
+        State0 = state(consumers([Entry])),
+        {Expired, Unblocked, State1} =
+            rabbit_queue_consumers:expire_acks(Now, State0),
+        ?assertEqual([{ChPid, <<"ctag1">>, [1]}], Expired),
+        ?assertEqual([], Unblocked),
+        %% The consumer is withheld from further deliveries.
+        ?assertMatch([{ChPid, <<"ctag1">>, _, _, false, timed_out, _, _}],
+                     rabbit_queue_consumers:all(State1, none, false)),
+        %% The delivery with a future deadline remains tracked.
+        ?assert(rabbit_queue_consumers:holds_acks(ChPid, <<"ctag1">>))
+    after
+        uninstall_ch_record(ChPid)
+    end.
+
+%% A tag value that expires again while an earlier timed-out entry for it
+%% is still unsettled is reassigned; the earlier owner's unsatisfiable
+%% debt is released so that it does not stay parked forever.
+expire_acks_reassigns_reused_tag(_Config) ->
+    ChPid = self(),
+    Now = erlang:monotonic_time(millisecond),
+    {_, Consumer1} = consumer(ChPid, <<"ctag1">>),
+    Entry2 = consumer(ChPid, <<"ctag2">>),
+    install_ch_record(ChPid, [],
+                      #{acktags => lqueue:in({5, <<"ctag2">>, Now - 1},
+                                             lqueue:new()),
+                        next_deadline => Now - 1,
+                        timed_out_acks => #{5 => <<"ctag1">>},
+                        timed_out_consumers => #{<<"ctag1">> => {Consumer1, 1}}}),
+    try
+        State0 = state(consumers([Entry2])),
+        {Expired, _Unblocked, State1} =
+            rabbit_queue_consumers:expire_acks(Now, State0),
+        ?assertEqual([{ChPid, <<"ctag2">>, [5]}], Expired),
+        Infos = lists:sort(rabbit_queue_consumers:all(State1, none, false)),
+        ?assertMatch([{ChPid, <<"ctag1">>, _, _, _, up, _, _},
+                      {ChPid, <<"ctag2">>, _, _, false, timed_out, _, _}],
+                     Infos)
+    after
+        uninstall_ch_record(ChPid)
+    end.
+
+%% A tag value is reused when a requeued message is delivered again, so a
+%% tag can be pending both as a live delivery and as a timed-out one.
+%% settle_released/3 must resolve to the timed-out entry and never to the
+%% live redelivery, which another consumer is still processing.
+settle_released_targets_timed_out_entry(_Config) ->
+    ChPid = self(),
+    Deadline = erlang:monotonic_time(millisecond) + 60_000,
+    {_, Consumer1} = consumer(ChPid, <<"ctag1">>),
+    install_ch_record(ChPid, [],
+                      #{acktags => lqueue:in({5, <<"ctag2">>, Deadline},
+                                             lqueue:new()),
+                        timed_out_acks => #{5 => <<"ctag1">>},
+                        timed_out_consumers => #{<<"ctag1">> => {Consumer1, 1}}}),
+    try
+        {Resumed, _State1} =
+            rabbit_queue_consumers:settle_released(ChPid, [5],
+                                                   state(consumers([]))),
+        %% The timed-out entry is settled, not the live redelivery.
+        ?assertMatch([{ChPid, {consumer, <<"ctag1">>, _, _, _, _, _}}], Resumed),
+        ?assert(rabbit_queue_consumers:holds_acks(ChPid, <<"ctag2">>)),
+        %% The live redelivery is settled by a regular settlement, which
+        %% must leave the (now empty) timed-out state alone.
+        {Matched, [], _State2} =
+            rabbit_queue_consumers:subtract_acks(ChPid, [5],
+                                                 state(consumers([]))),
+        ?assertEqual([5], Matched),
+        ?assertNot(rabbit_queue_consumers:holds_acks(ChPid, <<"ctag2">>))
+    after
+        uninstall_ch_record(ChPid)
+    end.
+
+%% A parked consumer resumes once all of its timed-out tags are settled,
+%% and not before. Settling through subtract_acks/3 exercises the
+%% fallback used by settlements that are not partitioned by the channel
+%% (for example AMQP 1.0 sessions).
+settle_resumes_parked_consumer(_Config) ->
+    ChPid = self(),
+    {_, Consumer1} = consumer(ChPid, <<"ctag1">>),
+    install_ch_record(ChPid, [],
+                      #{timed_out_acks => #{7 => <<"ctag1">>, 8 => <<"ctag1">>},
+                        timed_out_consumers => #{<<"ctag1">> => {Consumer1, 2}}}),
+    try
+        State0 = state(consumers([])),
+        {[], [], State1} =
+            rabbit_queue_consumers:subtract_acks(ChPid, [7], State0),
+        ?assertEqual(undefined, rabbit_queue_consumers:get_consumer(State1)),
+        {[], Resumed, State2} =
+            rabbit_queue_consumers:subtract_acks(ChPid, [8], State1),
+        ?assertEqual([{ChPid, Consumer1}], Resumed),
+        %% The consumer rejoined the rotation.
+        ?assertEqual({ChPid, Consumer1},
+                     rabbit_queue_consumers:get_consumer(State2))
+    after
+        uninstall_ch_record(ChPid)
+    end.
+
 %% #cr field order: ch_pid, monitor_ref, acktags, consumer_count,
 %% blocked_consumers, limiter, unsent_message_count, link_states,
-%% timed_out_acks, timed_out_consumers.
+%% timed_out_acks, timed_out_consumers, next_deadline.
 install_ch_record(ChPid, ConsumerEntries) ->
+    install_ch_record(ChPid, ConsumerEntries, #{}).
+
+install_ch_record(ChPid, ConsumerEntries, Overrides) ->
     BlockedQ = lists:foldl(fun (C, Acc) -> priority_queue:in(C, Acc) end,
                            priority_queue:new(), ConsumerEntries),
-    CR = {cr, ChPid, undefined, queue:new(), length(ConsumerEntries),
-          BlockedQ, undefined, 0, #{}, #{}, #{}},
+    Get = fun (Key, Default) -> maps:get(Key, Overrides, Default) end,
+    %% The consumer count is at least 1 so that the record is not erased
+    %% (and its undefined monitor reference demonitored) mid-test.
+    CR = {cr, ChPid, undefined,
+          Get(acktags, lqueue:new()),
+          Get(consumer_count, max(length(ConsumerEntries), 1)),
+          BlockedQ,
+          rabbit_limiter:client(undefined),
+          0, #{},
+          Get(timed_out_acks, #{}),
+          Get(timed_out_consumers, #{}),
+          Get(next_deadline, infinity)},
     put({ch, ChPid}, CR),
     ok.
 
@@ -177,8 +302,10 @@ consumers([H | T], Q) ->
 consumer(Pid, ConsumerTag) ->
     {Pid, {consumer, ConsumerTag, true, 1, [], <<"guest">>, 1_800_000}}.
 
+%% #state field order: consumers, use, next_deadline.
 state(Consumers) ->
-    {state, Consumers, {}, infinity}.
+    {state, Consumers,
+     {active, erlang:monotonic_time(microsecond), 1.0}, infinity}.
 
 function_for_process() ->
     receive

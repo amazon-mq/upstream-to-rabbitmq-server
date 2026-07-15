@@ -63,8 +63,9 @@
             %% timer used to delete expired messages
             ttl_timer_ref,
             ttl_timer_expiry,
-            %% consumer timeout applied unless overridden per consumer,
-            %% in milliseconds
+            %% Consumer timeout in milliseconds resolved from the policy
+            %% and queue argument, applied unless overridden per consumer;
+            %% undefined means the configured default applies.
             consumer_timeout,
             %% timer used to requeue deliveries that consumers did not
             %% acknowledge in time
@@ -527,8 +528,6 @@ init_dlx(DLX, State = #q{q = Q}) ->
 
 init_dlx_rkey(RoutingKey, State) -> State#q{dlx_routing_key = RoutingKey}.
 
-init_consumer_timeout(undefined, State) ->
-    State#q{consumer_timeout = rabbit_queue_type:default_consumer_timeout()};
 init_consumer_timeout(Timeout, State) ->
     State#q{consumer_timeout = Timeout}.
 
@@ -614,21 +613,17 @@ stop_expiry_timer(State) -> rabbit_misc:stop_timer(State, #q.expiry_timer_ref).
 
 ensure_ttl_timer(undefined, State) ->
     State;
-ensure_ttl_timer(Expiry, State = #q{ttl_timer_ref       = undefined,
+ensure_ttl_timer(Expiry, State = #q{ttl_timer_ref       = TRef,
+                                    ttl_timer_expiry    = TExpiry,
                                     args_policy_version = Version}) ->
     After = (case Expiry - os:system_time(microsecond) of
                  V when V > 0 -> V + 999; %% always fire later
                  _            -> 0
              end) div 1000,
-    TRef = rabbit_misc:send_after(After, self(), {drop_expired, Version}),
-    State#q{ttl_timer_ref = TRef, ttl_timer_expiry = Expiry};
-ensure_ttl_timer(Expiry, State = #q{ttl_timer_ref    = TRef,
-                                    ttl_timer_expiry = TExpiry})
-  when Expiry + 1000 < TExpiry ->
-    rabbit_misc:cancel_timer(TRef),
-    ensure_ttl_timer(Expiry, State#q{ttl_timer_ref = undefined});
-ensure_ttl_timer(_Expiry, State) ->
-    State.
+    {TRef1, TExpiry1} = ensure_deadline_timer(Expiry, After, 1000,
+                                              {drop_expired, Version},
+                                              TRef, TExpiry),
+    State#q{ttl_timer_ref = TRef1, ttl_timer_expiry = TExpiry1}.
 
 stop_ttl_timer(State) -> rabbit_misc:stop_timer(State, #q.ttl_timer_ref).
 
@@ -643,24 +638,32 @@ ensure_consumer_timeout_timer(State = #q{consumers = Consumers0}) ->
             schedule_consumer_timeout(Deadline, State#q{consumers = Consumers})
     end.
 
-schedule_consumer_timeout(infinity, State) ->
-    State;
-schedule_consumer_timeout(Deadline,
-                          State = #q{consumer_timeout_timer_ref = undefined}) ->
-    Now = erlang:monotonic_time(millisecond),
-    TRef = rabbit_misc:send_after(max(Deadline - Now, 0), self(),
-                                  evaluate_consumer_timeout),
-    State#q{consumer_timeout_timer_ref = TRef,
-            consumer_timeout_timer_deadline = Deadline};
 schedule_consumer_timeout(Deadline,
                           State = #q{consumer_timeout_timer_ref = TRef,
-                                     consumer_timeout_timer_deadline = TDeadline})
-  when Deadline + 1000 < TDeadline ->
+                                     consumer_timeout_timer_deadline = TDeadline}) ->
+    After = max(Deadline - erlang:monotonic_time(millisecond), 0),
+    {TRef1, TDeadline1} = ensure_deadline_timer(Deadline, After, 1000,
+                                                evaluate_consumer_timeout,
+                                                TRef, TDeadline),
+    State#q{consumer_timeout_timer_ref = TRef1,
+            consumer_timeout_timer_deadline = TDeadline1}.
+
+%% Arms a timer to fire TimerMsg after AfterMs. An already armed timer is
+%% kept unless the new deadline is earlier than the armed one by more than
+%% Slack, avoiding timer churn when deadlines move by small amounts.
+%% Deadline, TDeadline and Slack must use one time unit; AfterMs is always
+%% in milliseconds.
+ensure_deadline_timer(Deadline, AfterMs, _Slack, TimerMsg, undefined,
+                      _TDeadline) ->
+    {rabbit_misc:send_after(AfterMs, self(), TimerMsg), Deadline};
+ensure_deadline_timer(Deadline, AfterMs, Slack, TimerMsg, TRef, TDeadline)
+  when Deadline + Slack < TDeadline ->
     rabbit_misc:cancel_timer(TRef),
-    schedule_consumer_timeout(Deadline,
-                              State#q{consumer_timeout_timer_ref = undefined});
-schedule_consumer_timeout(_Deadline, State) ->
-    State.
+    ensure_deadline_timer(Deadline, AfterMs, Slack, TimerMsg, undefined,
+                          undefined);
+ensure_deadline_timer(_Deadline, _AfterMs, _Slack, _TimerMsg, TRef,
+                      TDeadline) ->
+    {TRef, TDeadline}.
 
 ensure_stats_timer(State) ->
     rabbit_event:ensure_stats_timer(State, #q.stats_timer, emit_stats).
@@ -968,9 +971,19 @@ discard(AckTags, DelFailed, ChPid, State) ->
                                        dead_letter_rejected_msgs(
                                          AckTags1, DelFailed, X, State1)
                                end) end,
-      fun () -> rabbit_global_counters:messages_dead_lettered(rejected, rabbit_classic_queue,
-                                                              disabled, length(AckTags)),
-                ack(AckTags, ChPid, State) end).
+      %% Only tags matched against live deliveries are dropped and counted;
+      %% tags that timed out were requeued already and settling them does
+      %% not dead-letter anything.
+      fun () -> subtract_acks(
+                  ChPid, AckTags, State,
+                  fun (AckTags1, State1 = #q{backing_queue       = BQ,
+                                             backing_queue_state = BQS}) ->
+                          rabbit_global_counters:messages_dead_lettered(
+                            rejected, rabbit_classic_queue, disabled,
+                            length(AckTags1)),
+                          {_Guids, BQS1} = BQ:ack(AckTags1, BQS),
+                          State1#q{backing_queue_state = BQS1}
+                  end) end).
 
 requeue_and_run(AckTags, Unblocked, State) ->
     requeue_and_run(AckTags, true, Unblocked, State).
@@ -997,16 +1010,16 @@ possibly_unblock(Update, ChPid, State = #q{consumers = Consumers}) ->
 
 evaluate_consumer_timeouts(State0 = #q{consumers = Consumers0}) ->
     Now = erlang:monotonic_time(millisecond),
-    {Expired, NextDeadline, Consumers} =
+    {Expired, Unblocked, Consumers} =
         rabbit_queue_consumers:expire_acks(Now, Consumers0),
-    State1 = State0#q{consumers = Consumers},
-    State = case Expired of
-                [] -> State1;
-                _  -> handle_expired_acks(Expired, State1)
-            end,
-    schedule_consumer_timeout(NextDeadline, State).
+    %% The timer for the next deadline is armed by next_state/1.
+    State = State0#q{consumers = Consumers},
+    case Expired of
+        [] -> State;
+        _  -> handle_expired_acks(Expired, Unblocked, State)
+    end.
 
-handle_expired_acks(Expired, State0 = #q{q = Q}) ->
+handle_expired_acks(Expired, Unblocked, State0 = #q{q = Q}) ->
     QName = amqqueue:get_name(Q),
     lists:foreach(
       fun ({ChPid, CTag, AckTags}) ->
@@ -1019,7 +1032,7 @@ handle_expired_acks(Expired, State0 = #q{q = Q}) ->
       end, Expired),
     State = maybe_deactivate_timed_out_sac(Expired, State0),
     AckTags = lists:append([Acks || {_ChPid, _CTag, Acks} <- Expired]),
-    requeue_and_run(AckTags, false, [], State).
+    requeue_and_run(AckTags, false, Unblocked, State).
 
 maybe_deactivate_timed_out_sac(_Expired,
                                State = #q{single_active_consumer_on = false}) ->
@@ -1027,41 +1040,39 @@ maybe_deactivate_timed_out_sac(_Expired,
 maybe_deactivate_timed_out_sac(_Expired, State = #q{active_consumer = none}) ->
     State;
 maybe_deactivate_timed_out_sac(Expired,
-                               State = #q{active_consumer = {ChPid, Consumer} = Holder,
-                                          consumers = Consumers}) ->
+                               State = #q{active_consumer =
+                                              {ChPid, Consumer} = Holder}) ->
     CTag = rabbit_queue_consumers:consumer_tag(Consumer),
     Affected = lists:any(fun ({CP, CT, _Acks}) ->
                                  CP =:= ChPid andalso CT =:= CTag
                          end, Expired),
-    %% the active consumer is replaced once all of its deliveries timed out,
-    %% mirroring rabbit_fifo
+    %% The active consumer is replaced once all of its deliveries timed
+    %% out, mirroring rabbit_fifo.
     case Affected andalso not rabbit_queue_consumers:holds_acks(ChPid, CTag) of
-        true ->
-            Holder1 = case rabbit_queue_consumers:get_consumer(Consumers) of
-                          undefined   -> none;
-                          NewConsumer -> NewConsumer
-                      end,
-            State1 = State#q{active_consumer = Holder1},
-            maybe_notify_consumer_updated(State1, Holder, Holder1),
-            notify_decorators(State1),
-            State1;
-        false ->
-            State
+        true  -> elect_active_consumer(Holder, State);
+        false -> State
     end.
 
 maybe_activate_resumed_sac(State = #q{single_active_consumer_on = true,
                                       active_consumer = none,
                                       consumers = Consumers}) ->
     case rabbit_queue_consumers:get_consumer(Consumers) of
-        undefined ->
-            State;
-        Consumer ->
-            State1 = State#q{active_consumer = Consumer},
-            maybe_notify_consumer_updated(State1, none, Consumer),
-            notify_decorators(State1),
-            State1
+        undefined -> State;
+        _Consumer -> elect_active_consumer(none, State)
     end;
 maybe_activate_resumed_sac(State) ->
+    State.
+
+%% Makes the next available consumer (or none) the single active consumer,
+%% notifying metrics and decorators of the transition.
+elect_active_consumer(Holder, State0 = #q{consumers = Consumers}) ->
+    Holder1 = case rabbit_queue_consumers:get_consumer(Consumers) of
+                  undefined -> none;
+                  Consumer  -> Consumer
+              end,
+    State = State0#q{active_consumer = Holder1},
+    maybe_notify_consumer_updated(State, Holder, Holder1),
+    notify_decorators(State),
     State.
 
 should_auto_delete(#q{q = Q})
@@ -1166,13 +1177,21 @@ subtract_acks(ChPid, AckTags, State = #q{consumers = Consumers}, Fun) ->
             run_message_queue(Unblocked, State2)
     end.
 
-consumer_timeout(Args, #q{consumer_timeout = Default}) ->
+consumer_timeout(Args, State) ->
     case rabbit_misc:table_lookup(Args, <<"x-consumer-timeout">>) of
         {_Type, Timeout} when is_integer(Timeout) ->
             Timeout;
         _ ->
-            Default
+            effective_consumer_timeout(State)
     end.
+
+%% The configured default is resolved per consume or basic.get operation
+%% rather than cached, so that runtime changes to the application
+%% environment apply to new deliveries, matching quorum queues.
+effective_consumer_timeout(#q{consumer_timeout = undefined}) ->
+    rabbit_queue_type:default_consumer_timeout();
+effective_consumer_timeout(#q{consumer_timeout = Timeout}) ->
+    Timeout.
 
 message_properties(Message, Confirm, #q{ttl = TTL}) ->
     {_, Size} = mc:size(Message),
@@ -1464,11 +1483,11 @@ handle_call({basic_get, ChPid, NoAck, LimiterPid}, _From,
          #q{backing_queue = BQ, backing_queue_state = BQS} = State2} ->
             State3 = case AckRequired of
                          true ->
-                             Deadline = erlang:monotonic_time(millisecond) +
-                                        State2#q.consumer_timeout,
-                             ok = rabbit_queue_consumers:record_ack(
-                                    ChPid, LimiterPid, AckTag, Deadline),
-                             schedule_consumer_timeout(Deadline, State2);
+                             Consumers1 = rabbit_queue_consumers:record_ack(
+                                            ChPid, LimiterPid, AckTag,
+                                            effective_consumer_timeout(State2),
+                                            State2#q.consumers),
+                             State2#q{consumers = Consumers1};
                          false ->
                              State2
                      end,
@@ -1710,6 +1729,19 @@ handle_cast({reject, false, AckTags, ChPid}, State) ->
 
 handle_cast({complete, AckTags, ChPid}, State) ->
     noreply(ack(AckTags, ChPid, State));
+
+handle_cast({settle_released, AckTags, ChPid},
+            State = #q{consumers = Consumers}) ->
+    case rabbit_queue_consumers:settle_released(ChPid, AckTags, Consumers) of
+        not_found ->
+            noreply(State);
+        {[], Consumers1} ->
+            noreply(State#q{consumers = Consumers1});
+        {Resumed, Consumers1} ->
+            State1 = maybe_activate_resumed_sac(
+                       State#q{consumers = Consumers1}),
+            noreply(run_message_queue(Resumed, State1))
+    end;
 
 handle_cast({requeue, AckTags, ChPid}, State) ->
     noreply(requeue(AckTags, false, ChPid, State));

@@ -342,6 +342,15 @@ cancel(Q, Spec, State) ->
 -spec settle(rabbit_amqqueue:name(), rabbit_queue_type:settle_op(),
              rabbit_types:ctag(), [non_neg_integer()], state()) ->
     {state(), rabbit_queue_type:actions()}.
+settle(_QName, released, _CTag, MsgIds, State = #?STATE{pid = Pid}) ->
+    %% Settlement of deliveries that the queue released on consumer
+    %% timeout: the messages were requeued when the timeout fired, so
+    %% only the timed-out state is settled. A queue process that emits
+    %% released events always understands this operation, so no feature
+    %% flag check is needed.
+    Arg = {settle_released, MsgIds, self()},
+    delegate:invoke_no_result(Pid, {gen_server2, cast, [Arg]}),
+    {State, []};
 settle(QName, Op, CTag, MsgIds, State) ->
     case rabbit_feature_flags:is_enabled('rabbitmq_4.3.0') of
         true -> settle_43(QName, Op, CTag, MsgIds, State);
