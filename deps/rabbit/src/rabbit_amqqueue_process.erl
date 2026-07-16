@@ -642,7 +642,8 @@ schedule_consumer_timeout(Deadline,
                           State = #q{consumer_timeout_timer_ref = TRef,
                                      consumer_timeout_timer_deadline = TDeadline}) ->
     After = max(Deadline - erlang:monotonic_time(millisecond), 0),
-    {TRef1, TDeadline1} = ensure_deadline_timer(Deadline, After, 1000,
+    %% Slack is in milliseconds here, unlike ensure_ttl_timer's microseconds.
+    {TRef1, TDeadline1} = ensure_deadline_timer(Deadline, After, 1,
                                                 evaluate_consumer_timeout,
                                                 TRef, TDeadline),
     State#q{consumer_timeout_timer_ref = TRef1,

@@ -1196,7 +1196,10 @@ settle(_QName, discard, CTag, MsgIds, QState) ->
     rabbit_fifo_client:discard(quorum_ctag(CTag), MsgIds, QState);
 settle(_QName, {modify, DelFailed, Undel, Anns}, CTag, MsgIds, QState) ->
     rabbit_fifo_client:modify(quorum_ctag(CTag), MsgIds, DelFailed, Undel,
-                              Anns, QState).
+                              Anns, QState);
+settle(QName, released, _CTag, _MsgIds, _QState) ->
+    %% released is only emitted by classic queues on consumer timeout.
+    error({unexpected_settle_op, QName, released}).
 
 credit(_QName, CTag, DeliveryCount, Credit, Drain, QState) ->
     rabbit_fifo_client:credit(quorum_ctag(CTag), DeliveryCount, Credit, Drain, QState).

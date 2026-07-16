@@ -1490,8 +1490,7 @@ handle_method(#'basic.recover_async'{requeue = true},
     OkFun = fun () -> ok end,
     UAMQL = ?QUEUE:to_list(UAMQ),
 
-    {Released, Live} = partition_released(UAMQL),
-    {QueueStates1, Actions1} = settle_released_acks(Released, QueueStates0),
+    {Live, QueueStates1, Actions1} = settle_released(UAMQL, QueueStates0),
     {QueueStates, Actions} =
         foreach_per_queue(
           fun ({QRef, CTag}, MsgIds, {Acc0, Actions0}) ->
@@ -1911,8 +1910,7 @@ reject(DeliveryTag, Op, Multiple,
 %% NB: Acked is in youngest-first order
 internal_reject(Op, Acked, Limiter,
                 State = #ch{queue_states = QueueStates0}) ->
-    {Released, Live} = partition_released(Acked),
-    {QueueStates1, Actions1} = settle_released_acks(Released, QueueStates0),
+    {Live, QueueStates1, Actions1} = settle_released(Acked, QueueStates0),
     {QueueStates, Actions} =
         foreach_per_queue(
           fun({QRef, CTag}, MsgIds, {Acc0, Actions0}) ->
@@ -1947,6 +1945,14 @@ settle_released_acks(Released, QueueStates0) ->
                       rabbit_misc:protocol_error(ErrorType, Reason, ReasonArgs)
               end
       end, Released, {QueueStates0, []}).
+
+%% Splits Acked into released and live ack tags (see partition_released/1)
+%% and settles the released ones, leaving the caller to settle Live with
+%% whichever settle_op applies at that call site.
+settle_released(Acked, QueueStates0) ->
+    {Released, Live} = partition_released(Acked),
+    {QueueStates1, Actions1} = settle_released_acks(Released, QueueStates0),
+    {Live, QueueStates1, Actions1}.
 
 record_sent(Type, QueueType, Tag, AckRequired,
             Msg = {QName, _QPid, MsgId, Redelivered, _Message},
@@ -2042,8 +2048,7 @@ collect_acks(AcknowledgedAcc, RemainingAcc, UAMQ, DeliveryTag, Multiple) ->
 %% Settles (acknowledges) messages at the queue replica process level.
 %% This happens in the oldest-first order (ascending by delivery tag).
 settle_acks(Acks, State = #ch{queue_states = QueueStates0}) ->
-    {Released, Live} = partition_released(Acks),
-    {QueueStates1, ActionsAcc1} = settle_released_acks(Released, QueueStates0),
+    {Live, QueueStates1, ActionsAcc1} = settle_released(Acks, QueueStates0),
     {QueueStates, Actions} =
         foreach_per_queue(
           fun ({QRef, CTag}, MsgIds, {Acc0, ActionsAcc0}) ->
