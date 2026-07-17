@@ -850,33 +850,24 @@ handle_stashed_consumer_timeout(#state{stashed_consumer_timeout = Map} = State)
 handle_stashed_consumer_timeout(#state{cfg = #cfg{container_id = ContainerId,
                                                   conn_name = ConnName},
                                        stashed_consumer_timeout = ConsumerTimeout,
-                                       outgoing_unsettled_map = Unsettled0,
-                                       outgoing_links = Links0,
-                                       queue_states = QStates} = State0) ->
-    {Ids, CTags, Unsettled} =
+                                       outgoing_unsettled_map = Unsettled,
+                                       outgoing_links = Links0} = State0) ->
+    %% The outgoing_unsettled_map entries were already marked
+    %% released=true synchronously in handle_queue_actions/2; this only
+    %% collects which delivery ids to notify the client about (and log),
+    %% scoped to the tags newly released since the last flush.
+    {Ids, CTags} =
     maps:fold(fun(DeliveryId,
-                 #outgoing_unsettled{queue_name = QName,
-                                     consumer_tag = CTag,
-                                     msg_id = MsgId} = U,
-                 {Ids0, CTags0, U0} = Acc) ->
+                 #outgoing_unsettled{consumer_tag = CTag,
+                                     msg_id = MsgId},
+                 {Ids0, CTags0} = Acc) ->
                       case is_map_key({CTag, MsgId}, ConsumerTimeout) of
                           true ->
-                              %% Only classic queues reuse msg_ids on
-                              %% redelivery, so only their released
-                              %% deliveries need the dedicated settle op;
-                              %% other queue types don't implement it.
-                              U1 = case rabbit_queue_type:module(QName, QStates) of
-                                       {ok, rabbit_classic_queue} ->
-                                           U#outgoing_unsettled{released = true};
-                                       _ ->
-                                           U
-                                   end,
-                              {[DeliveryId | Ids0], CTags0#{CTag => true},
-                               U0#{DeliveryId := U1}};
+                              {[DeliveryId | Ids0], CTags0#{CTag => true}};
                           false ->
                               Acc
                       end
-              end, {[], #{}, Unsettled0}, Unsettled0),
+              end, {[], #{}}, Unsettled),
     Links = maps:fold(
               fun(CTag, true, Acc) ->
                       Handle = ctag_to_handle(CTag),
@@ -895,7 +886,6 @@ handle_stashed_consumer_timeout(#state{cfg = #cfg{container_id = ContainerId,
                       end
               end, Links0, CTags),
     State = State0#state{stashed_consumer_timeout = #{},
-                         outgoing_unsettled_map = Unsettled,
                          outgoing_links = Links},
     {Ids, State}.
 
@@ -2287,11 +2277,44 @@ handle_queue_actions(Actions, State) ->
               S#state{stashed_settled = [Action | As]};
           ({rejected, _QName, _Reason, _DelIds} = Action, #state{stashed_rejected = As} = S) ->
               S#state{stashed_rejected = [Action | As]};
-          ({released, _QName, CTag, MsgIds, timeout}, #state{stashed_consumer_timeout = Map} = S) ->
+          ({released, QName, CTag, MsgIds, timeout},
+           #state{stashed_consumer_timeout = Map,
+                  outgoing_unsettled_map = Unsettled0,
+                  queue_states = QStates} = S) ->
               L = lists:map(fun(MsgId) ->
                                     {{CTag, MsgId}, true}
                             end, MsgIds),
-              S#state{stashed_consumer_timeout = maps:merge(Map, maps:from_list(L))};
+              %% Mark the matching outgoing_unsettled_map entries
+              %% released=true synchronously here, unlike the
+              %% client-facing DISPOSITION notification and log message
+              %% (see handle_stashed_consumer_timeout/1), which stay
+              %% deferred/coalesced: this queue_event and a client
+              %% frame_body cast come from different, unordered senders,
+              %% so a client's own late disposition for the same
+              %% (already reused) msg_id could otherwise be processed
+              %% before the deferred flush ever flags the entry,
+              %% settling it with the client's outcome instead of
+              %% 'released' and corrupting the live redelivery that now
+              %% shares that msg_id. Only classic queues reuse msg_ids
+              %% on redelivery, so only their entries need this.
+              Unsettled = case rabbit_queue_type:module(QName, QStates) of
+                              {ok, rabbit_classic_queue} ->
+                                  MsgIdSet = maps:from_keys(MsgIds, true),
+                                  maps:map(
+                                    fun(_DeliveryId,
+                                        #outgoing_unsettled{consumer_tag = CT,
+                                                           msg_id = MsgId} = U)
+                                          when CT =:= CTag,
+                                               is_map_key(MsgId, MsgIdSet) ->
+                                            U#outgoing_unsettled{released = true};
+                                       (_DeliveryId, U) ->
+                                            U
+                                    end, Unsettled0);
+                              _ ->
+                                  Unsettled0
+                          end,
+              S#state{stashed_consumer_timeout = maps:merge(Map, maps:from_list(L)),
+                      outgoing_unsettled_map = Unsettled};
           ({deliver, CTag, AckRequired, Msgs}, S0) ->
               lists:foldl(fun(Msg, S) ->
                                   handle_deliver(CTag, AckRequired, Msg, S)
