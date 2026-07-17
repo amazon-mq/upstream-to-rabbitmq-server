@@ -1201,7 +1201,6 @@ handle_frame(#'v1_0.disposition'{role = ?AMQP_ROLE_RECEIVER,
                     {Settled0, maps:from_list(UnsettledList)}
             end,
 
-            SettleOp = settle_op_from_outcome(Outcome),
             {QStates, Actions} =
             maps:fold(
               fun({QName, Ctag, Released}, MsgIdsRev, {QS0, ActionsAcc}) ->
@@ -1210,10 +1209,13 @@ handle_frame(#'v1_0.disposition'{role = ?AMQP_ROLE_RECEIVER,
                       %% timeout settles as 'released' regardless of the
                       %% client's outcome, since its msg_id may already be
                       %% reused by a redelivery (see the released field on
-                      %% #outgoing_unsettled{}).
+                      %% #outgoing_unsettled{}). settle_op_from_outcome/1 is
+                      %% only called for a non-released group: the 'state'
+                      %% field is optional, so a client confirming a batch
+                      %% that is entirely released deliveries may omit it.
                       Op = case Released of
                                true  -> released;
-                               false -> SettleOp
+                               false -> settle_op_from_outcome(Outcome)
                            end,
                       case rabbit_queue_type:settle(QName, Op, Ctag, MsgIds, QS0) of
                           {ok, QS, Actions0} ->
