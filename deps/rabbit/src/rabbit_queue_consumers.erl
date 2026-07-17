@@ -472,7 +472,7 @@ subtract_acks(ChPid, AckTags, State) ->
                               rabbit_limiter:ack_from_queue(LimN, CTag, Count),
                           {UnblockedN orelse Unblocked1, LimN1}
                   end, {false, Lim}, CTagCounts),
-            C2 = C1#cr{limiter = Lim2},
+            C2 = maybe_reset_next_deadline(C1#cr{limiter = Lim2}),
             State1 = resume_consumers(Resumed, State),
             case Unblocked of
                 true  -> case unblock(C2, State1) of
@@ -484,6 +484,17 @@ subtract_acks(ChPid, AckTags, State) ->
                 false -> update_ch_record(C2),
                          {Matched, Resumed, State1}
             end
+    end.
+
+%% #cr.next_deadline only ever decreases as new deliveries arrive and is
+%% recomputed exactly on the next expire_ch_acks/3 scan, so a stale (too
+%% early) value merely costs one redundant scan; reset it to infinity once
+%% nothing is left to expire, so a channel that drains its acks doesn't
+%% wake the queue process once more for nothing.
+maybe_reset_next_deadline(C = #cr{acktags = AckTags, timed_out_acks = TimedOutAcks}) ->
+    case ?QUEUE:is_empty(AckTags) andalso map_size(TimedOutAcks) =:= 0 of
+        true  -> C#cr{next_deadline = infinity};
+        false -> C
     end.
 
 resume_consumers(Resumed, State) ->
@@ -531,7 +542,7 @@ settle_released(ChPid, AckTags, State) ->
             Tags = [Tag || Tag <- lists:usort(AckTags),
                            is_map_key(Tag, TimedOutAcks)],
             {Resumed, C1} = settle_timed_out(Tags, C),
-            update_ch_record(C1),
+            update_ch_record(maybe_reset_next_deadline(C1)),
             {Resumed, resume_consumers(Resumed, State)}
     end.
 

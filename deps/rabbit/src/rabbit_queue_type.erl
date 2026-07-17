@@ -63,6 +63,7 @@
          arguments/2,
          notify_decorators/1,
          default_consumer_timeout/0,
+         table_lookup/3,
          publish_at_most_once/2,
          can_redeliver/2,
          rebalance_module/1,

@@ -248,7 +248,14 @@
           %% The queue sent us this consumer scoped sequence number.
           msg_id :: rabbit_amqqueue:msg_id(),
           consumer_tag :: rabbit_types:ctag(),
-          queue_name :: rabbit_amqqueue:name()
+          queue_name :: rabbit_amqqueue:name(),
+          %% Set once the queue released this delivery on consumer timeout.
+          %% The queue reuses classic queue msg_ids on redelivery, so a late
+          %% disposition for this entry must only clear the timeout state
+          %% (settle_op released) rather than settle whatever redelivery
+          %% now holds the same msg_id (see rabbit_channel:mark_released/4
+          %% for the equivalent AMQP 0-9-1 mechanism).
+          released = false :: boolean()
          }).
 
 -record(pending_delivery, {
@@ -843,19 +850,33 @@ handle_stashed_consumer_timeout(#state{stashed_consumer_timeout = Map} = State)
 handle_stashed_consumer_timeout(#state{cfg = #cfg{container_id = ContainerId,
                                                   conn_name = ConnName},
                                        stashed_consumer_timeout = ConsumerTimeout,
-                                       outgoing_unsettled_map = Unsettled,
-                                       outgoing_links = Links0} = State0) ->
-    {Ids, CTags} = maps:fold(fun(DeliveryId,
-                                 #outgoing_unsettled{consumer_tag = CTag,
-                                                     msg_id = MsgId},
-                                 {Ids0, CTags0} = Acc) ->
-                                     case is_map_key({CTag, MsgId}, ConsumerTimeout) of
-                                         true ->
-                                             {[DeliveryId | Ids0], CTags0#{CTag => true}};
-                                         false ->
-                                             Acc
-                                     end
-                             end, {[], #{}}, Unsettled),
+                                       outgoing_unsettled_map = Unsettled0,
+                                       outgoing_links = Links0,
+                                       queue_states = QStates} = State0) ->
+    {Ids, CTags, Unsettled} =
+    maps:fold(fun(DeliveryId,
+                 #outgoing_unsettled{queue_name = QName,
+                                     consumer_tag = CTag,
+                                     msg_id = MsgId} = U,
+                 {Ids0, CTags0, U0} = Acc) ->
+                      case is_map_key({CTag, MsgId}, ConsumerTimeout) of
+                          true ->
+                              %% Only classic queues reuse msg_ids on
+                              %% redelivery, so only their released
+                              %% deliveries need the dedicated settle op;
+                              %% other queue types don't implement it.
+                              U1 = case rabbit_queue_type:module(QName, QStates) of
+                                       {ok, rabbit_classic_queue} ->
+                                           U#outgoing_unsettled{released = true};
+                                       _ ->
+                                           U
+                                   end,
+                              {[DeliveryId | Ids0], CTags0#{CTag => true},
+                               U0#{DeliveryId := U1}};
+                          false ->
+                              Acc
+                      end
+              end, {[], #{}, Unsettled0}, Unsettled0),
     Links = maps:fold(
               fun(CTag, true, Acc) ->
                       Handle = ctag_to_handle(CTag),
@@ -874,6 +895,7 @@ handle_stashed_consumer_timeout(#state{cfg = #cfg{container_id = ContainerId,
                       end
               end, Links0, CTags),
     State = State0#state{stashed_consumer_timeout = #{},
+                         outgoing_unsettled_map = Unsettled,
                          outgoing_links = Links},
     {Ids, State}.
 
@@ -1160,12 +1182,13 @@ handle_frame(#'v1_0.disposition'{role = ?AMQP_ROLE_RECEIVER,
                       fun (DeliveryId,
                            #outgoing_unsettled{queue_name = QName,
                                                consumer_tag = Ctag,
-                                               msg_id = MsgId} = Unsettled,
+                                               msg_id = MsgId,
+                                               released = Released} = Unsettled,
                            {SettledAcc, UnsettledAcc}) ->
                               case serial_number:in_range(DeliveryId, First, Last) of
                                   true ->
                                       SettledAcc1 = maps_update_with(
-                                                      {QName, Ctag},
+                                                      {QName, Ctag, Released},
                                                       fun(MsgIds) -> [MsgId | MsgIds] end,
                                                       [MsgId],
                                                       SettledAcc),
@@ -1181,11 +1204,20 @@ handle_frame(#'v1_0.disposition'{role = ?AMQP_ROLE_RECEIVER,
             SettleOp = settle_op_from_outcome(Outcome),
             {QStates, Actions} =
             maps:fold(
-              fun({QName, Ctag}, MsgIdsRev, {QS0, ActionsAcc}) ->
+              fun({QName, Ctag, Released}, MsgIdsRev, {QS0, ActionsAcc}) ->
                       MsgIds = lists:reverse(MsgIdsRev),
-                      case rabbit_queue_type:settle(QName, SettleOp, Ctag, MsgIds, QS0) of
+                      %% A delivery the queue already released on consumer
+                      %% timeout settles as 'released' regardless of the
+                      %% client's outcome, since its msg_id may already be
+                      %% reused by a redelivery (see the released field on
+                      %% #outgoing_unsettled{}).
+                      Op = case Released of
+                               true  -> released;
+                               false -> SettleOp
+                           end,
+                      case rabbit_queue_type:settle(QName, Op, Ctag, MsgIds, QS0) of
                           {ok, QS, Actions0} ->
-                              messages_acknowledged(SettleOp, QName, QS, MsgIds),
+                              messages_acknowledged(Op, QName, QS, MsgIds),
                               {QS, ActionsAcc ++ Actions0};
                           {protocol_error, _ErrorType, Reason, ReasonArgs} ->
                               protocol_error(?V_1_0_AMQP_ERROR_INTERNAL_ERROR,
@@ -2115,9 +2147,10 @@ settle_delivery_id(Current, {Settled, Unsettled} = Acc) ->
     case maps:take(Current, Unsettled) of
         {#outgoing_unsettled{queue_name = QName,
                              consumer_tag = Ctag,
-                             msg_id = MsgId}, Unsettled1} ->
+                             msg_id = MsgId,
+                             released = Released}, Unsettled1} ->
             Settled1 = maps_update_with(
-                         {QName, Ctag},
+                         {QName, Ctag, Released},
                          fun(MsgIds) -> [MsgId | MsgIds] end,
                          [MsgId],
                          Settled),

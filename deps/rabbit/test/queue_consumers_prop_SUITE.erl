@@ -332,11 +332,15 @@ settle_released_state(St, Tag) ->
     #m{consumers = Cs0, released = Released0} = St,
     Released = maps:remove(Tag, Released0),
     CTag = maps:get(Tag, Released0),
+    %% Only an already-parked holder can resume here: settling a debt must
+    %% not park a consumer that has never timed out anything of its own,
+    %% mirroring the guard cmd_expire's next_state applies via Parked0.
     Cs = case Cs0 of
-             #{CTag := Info} ->
+             #{CTag := Info = #{parked := true}} ->
                  Cs0#{CTag := Info#{parked := has_debt(CTag, Released)}};
              _ ->
-                 %% The owner was cancelled while parked.
+                 %% Either the owner was cancelled while parked, or it was
+                 %% never parked and inherits no debt until it times out.
                  Cs0
          end,
     St#m{consumers = Cs, released = Released}.

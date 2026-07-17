@@ -1179,12 +1179,8 @@ subtract_acks(ChPid, AckTags, State = #q{consumers = Consumers}, Fun) ->
     end.
 
 consumer_timeout(Args, State) ->
-    case rabbit_misc:table_lookup(Args, <<"x-consumer-timeout">>) of
-        {_Type, Timeout} when is_integer(Timeout) ->
-            Timeout;
-        _ ->
-            effective_consumer_timeout(State)
-    end.
+    rabbit_queue_type:table_lookup(Args, <<"x-consumer-timeout">>,
+                                   effective_consumer_timeout(State)).
 
 %% The configured default is resolved per consume or basic.get operation
 %% rather than cached, so that runtime changes to the application
