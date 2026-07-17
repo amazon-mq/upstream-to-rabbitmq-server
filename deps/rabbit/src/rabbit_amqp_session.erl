@@ -1201,21 +1201,29 @@ handle_frame(#'v1_0.disposition'{role = ?AMQP_ROLE_RECEIVER,
                     {Settled0, maps:from_list(UnsettledList)}
             end,
 
+            %% A delivery the queue already released on consumer timeout
+            %% settles as 'released' regardless of the client's outcome,
+            %% since its msg_id may already be reused by a redelivery (see
+            %% the released field on #outgoing_unsettled{}). The 'state'
+            %% field is optional, so a client confirming a batch that is
+            %% entirely released deliveries may omit it: only resolve it
+            %% when some group in this batch actually needs it, and before
+            %% any group's settlement runs, so a batch mixing released and
+            %% live groups can't settle the former and then fail on the
+            %% latter's invalid outcome.
+            HasLive = lists:any(fun ({_, _, Released}) -> not Released end,
+                                maps:keys(Settled)),
+            SettleOp = case HasLive of
+                          true  -> settle_op_from_outcome(Outcome);
+                          false -> undefined
+                       end,
             {QStates, Actions} =
             maps:fold(
               fun({QName, Ctag, Released}, MsgIdsRev, {QS0, ActionsAcc}) ->
                       MsgIds = lists:reverse(MsgIdsRev),
-                      %% A delivery the queue already released on consumer
-                      %% timeout settles as 'released' regardless of the
-                      %% client's outcome, since its msg_id may already be
-                      %% reused by a redelivery (see the released field on
-                      %% #outgoing_unsettled{}). settle_op_from_outcome/1 is
-                      %% only called for a non-released group: the 'state'
-                      %% field is optional, so a client confirming a batch
-                      %% that is entirely released deliveries may omit it.
                       Op = case Released of
                                true  -> released;
-                               false -> settle_op_from_outcome(Outcome)
+                               false -> SettleOp
                            end,
                       case rabbit_queue_type:settle(QName, Op, Ctag, MsgIds, QS0) of
                           {ok, QS, Actions0} ->
