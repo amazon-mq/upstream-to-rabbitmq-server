@@ -2302,9 +2302,11 @@ handle_queue_actions(Actions, State) ->
                                   MsgIdSet = maps:from_keys(MsgIds, true),
                                   maps:map(
                                     fun(_DeliveryId,
-                                        #outgoing_unsettled{consumer_tag = CT,
+                                        #outgoing_unsettled{queue_name = QN,
+                                                           consumer_tag = CT,
                                                            msg_id = MsgId} = U)
-                                          when CT =:= CTag,
+                                          when QN =:= QName,
+                                               CT =:= CTag,
                                                is_map_key(MsgId, MsgIdSet) ->
                                             U#outgoing_unsettled{released = true};
                                        (_DeliveryId, U) ->
