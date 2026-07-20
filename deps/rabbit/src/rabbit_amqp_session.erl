@@ -2093,11 +2093,27 @@ sent_pending_delivery(#pending_delivery{
 record_outgoing_unsettled(#pending_delivery{queue_ack_required = true,
                                             delivery_id = DeliveryId,
                                             outgoing_unsettled = Unsettled},
-                          #state{outgoing_unsettled_map = Map0} = State) ->
+                          #state{outgoing_unsettled_map = Map0,
+                                 stashed_consumer_timeout = ConsumerTimeout0} = State) ->
     %% Record by DeliveryId such that we will ack this message to the queue
     %% once we receive the DISPOSITION from the AMQP client.
     Map = Map0#{DeliveryId => Unsettled},
-    State#state{outgoing_unsettled_map = Map};
+    %% This delivery may already have been released while it was still
+    %% buffered in outgoing_pending, stalled by session-level flow control
+    %% (see handle_queue_actions/2's {released,...} clause). The client can
+    %% only be told about it once it is actually flushed, so stash it for
+    %% notification now rather than at release time.
+    ConsumerTimeout = case Unsettled of
+                          #outgoing_unsettled{released = true,
+                                              queue_name = QName,
+                                              consumer_tag = CTag,
+                                              msg_id = MsgId} ->
+                              ConsumerTimeout0#{{QName, CTag, MsgId} => true};
+                          _ ->
+                              ConsumerTimeout0
+                      end,
+    State#state{outgoing_unsettled_map = Map,
+               stashed_consumer_timeout = ConsumerTimeout};
 record_outgoing_unsettled(#pending_delivery{queue_ack_required = false}, State) ->
     %% => 'snd-settle-mode' at attachment must have been 'settled'.
     %% => 'settled' field in TRANSFER must have been 'true'.
