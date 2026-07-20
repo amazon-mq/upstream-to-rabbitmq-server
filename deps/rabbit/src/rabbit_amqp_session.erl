@@ -393,7 +393,8 @@
           %% Queues that got deleted.
           stashed_eol = [] :: [rabbit_amqqueue:name()],
           %% The queue spontaneously released messages since the consumer did not settle in time.
-          stashed_consumer_timeout = #{} :: #{{rabbit_types:ctag(),
+          stashed_consumer_timeout = #{} :: #{{rabbit_amqqueue:name(),
+                                               rabbit_types:ctag(),
                                                rabbit_amqqueue:msg_id()} => true},
 
           queue_states = rabbit_queue_type:init() :: rabbit_queue_type:state(),
@@ -858,10 +859,11 @@ handle_stashed_consumer_timeout(#state{cfg = #cfg{container_id = ContainerId,
     %% scoped to the tags newly released since the last flush.
     {Ids, CTags} =
     maps:fold(fun(DeliveryId,
-                 #outgoing_unsettled{consumer_tag = CTag,
+                 #outgoing_unsettled{queue_name = QName,
+                                     consumer_tag = CTag,
                                      msg_id = MsgId},
                  {Ids0, CTags0} = Acc) ->
-                      case is_map_key({CTag, MsgId}, ConsumerTimeout) of
+                      case is_map_key({QName, CTag, MsgId}, ConsumerTimeout) of
                           true ->
                               {[DeliveryId | Ids0], CTags0#{CTag => true}};
                           false ->
@@ -2280,9 +2282,10 @@ handle_queue_actions(Actions, State) ->
           ({released, QName, CTag, MsgIds, timeout},
            #state{stashed_consumer_timeout = Map,
                   outgoing_unsettled_map = Unsettled0,
+                  outgoing_pending = Pending0,
                   queue_states = QStates} = S) ->
               L = lists:map(fun(MsgId) ->
-                                    {{CTag, MsgId}, true}
+                                    {{QName, CTag, MsgId}, true}
                             end, MsgIds),
               %% Mark the matching outgoing_unsettled_map entries
               %% released=true synchronously here, unlike the
@@ -2297,26 +2300,56 @@ handle_queue_actions(Actions, State) ->
               %% 'released' and corrupting the live redelivery that now
               %% shares that msg_id. Only classic queues reuse msg_ids
               %% on redelivery, so only their entries need this.
-              Unsettled = case rabbit_queue_type:module(QName, QStates) of
-                              {ok, rabbit_classic_queue} ->
-                                  MsgIdSet = maps:from_keys(MsgIds, true),
-                                  maps:map(
-                                    fun(_DeliveryId,
-                                        #outgoing_unsettled{queue_name = QN,
-                                                           consumer_tag = CT,
-                                                           msg_id = MsgId} = U)
-                                          when QN =:= QName,
-                                               CT =:= CTag,
-                                               is_map_key(MsgId, MsgIdSet) ->
-                                            U#outgoing_unsettled{released = true};
-                                       (_DeliveryId, U) ->
-                                            U
-                                    end, Unsettled0);
-                              _ ->
-                                  Unsettled0
-                          end,
+              %%
+              %% A delivery can also still be sitting unsent in
+              %% outgoing_pending (stalled by session-level flow control)
+              %% when its timeout fires, so it has no outgoing_unsettled_map
+              %% entry yet for the above to touch; mark it released here too,
+              %% so that once it is eventually flushed it is recorded with
+              %% released=true instead of the default false. This only
+              %% touches deliveries already pending at this exact moment, not
+              %% any future redelivery of the same msg_id, which is queued
+              %% afterwards as its own new outgoing_pending entry.
+              {Unsettled, Pending} =
+              case rabbit_queue_type:module(QName, QStates) of
+                  {ok, rabbit_classic_queue} ->
+                      MsgIdSet = maps:from_keys(MsgIds, true),
+                      U1 = maps:map(
+                             fun(_DeliveryId,
+                                 #outgoing_unsettled{queue_name = QN,
+                                                     consumer_tag = CT,
+                                                     msg_id = MsgId} = U)
+                                   when QN =:= QName,
+                                        CT =:= CTag,
+                                        is_map_key(MsgId, MsgIdSet) ->
+                                     U#outgoing_unsettled{released = true};
+                                (_DeliveryId, U) ->
+                                     U
+                             end, Unsettled0),
+                      P1 = queue:from_list(
+                             lists:map(
+                               fun(#pending_delivery{
+                                     outgoing_unsettled =
+                                     #outgoing_unsettled{queue_name = QN,
+                                                         consumer_tag = CT,
+                                                         msg_id = MsgId} = U
+                                    } = PD)
+                                     when QN =:= QName,
+                                          CT =:= CTag,
+                                          is_map_key(MsgId, MsgIdSet) ->
+                                     PD#pending_delivery{
+                                       outgoing_unsettled =
+                                       U#outgoing_unsettled{released = true}};
+                                  (Other) ->
+                                     Other
+                               end, queue:to_list(Pending0))),
+                      {U1, P1};
+                  _ ->
+                      {Unsettled0, Pending0}
+              end,
               S#state{stashed_consumer_timeout = maps:merge(Map, maps:from_list(L)),
-                      outgoing_unsettled_map = Unsettled};
+                      outgoing_unsettled_map = Unsettled,
+                      outgoing_pending = Pending};
           ({deliver, CTag, AckRequired, Msgs}, S0) ->
               lists:foldl(fun(Msg, S) ->
                                   handle_deliver(CTag, AckRequired, Msg, S)
