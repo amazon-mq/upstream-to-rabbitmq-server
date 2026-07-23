@@ -486,33 +486,40 @@ begin_stream(#stream_client{name = QName,
   when is_pid(LocalPid) ->
     CounterSpec = {{?MODULE, QName, Tag, self()}, []},
     Options1 = Options0#{read_ahead => read_ahead()},
-    {ok, Seg0} = osiris:init_reader(LocalPid, Offset, CounterSpec, Options1),
-    NextOffset = osiris_log_reader:next_offset(Seg0) - 1,
-    osiris:register_offset_listener(LocalPid, NextOffset),
-    StartOffset = case Offset of
-                      first -> NextOffset;
-                      last -> NextOffset;
-                      next -> NextOffset;
-                      {timestamp, _} -> NextOffset;
-                      _ -> Offset
-                  end,
-    {DeliveryCount, Credit} = case Mode of
-                                  {simple_prefetch, N} ->
-                                      {none, N};
-                                  {credited, InitialDC} ->
-                                      {InitialDC, 0}
-                              end,
-    Str0 = #stream{mode = Mode,
-                   delivery_count = DeliveryCount,
-                   credit = Credit,
-                   ack = AckRequired,
-                   start_offset = StartOffset,
-                   listening_offset = NextOffset,
-                   last_consumed_offset = StartOffset,
-                   log = Seg0,
-                   filter = Filter,
-                   reader_options = Options1},
-    {ok, State#stream_client{readers = Readers0#{Tag => Str0}}}.
+    case osiris:init_reader(LocalPid, Offset, CounterSpec, Options1) of
+        {ok, Seg0} ->
+            NextOffset = osiris_log_reader:next_offset(Seg0) - 1,
+            osiris:register_offset_listener(LocalPid, NextOffset),
+            StartOffset = case Offset of
+                              first -> NextOffset;
+                              last -> NextOffset;
+                              next -> NextOffset;
+                              {timestamp, _} -> NextOffset;
+                              _ -> Offset
+                          end,
+            {DeliveryCount, Credit} = case Mode of
+                                          {simple_prefetch, N} ->
+                                              {none, N};
+                                          {credited, InitialDC} ->
+                                              {InitialDC, 0}
+                                      end,
+            Str0 = #stream{mode = Mode,
+                           delivery_count = DeliveryCount,
+                           credit = Credit,
+                           ack = AckRequired,
+                           start_offset = StartOffset,
+                           listening_offset = NextOffset,
+                           last_consumed_offset = StartOffset,
+                           log = Seg0,
+                           filter = Filter,
+                           reader_options = Options1},
+            {ok, State#stream_client{readers = Readers0#{Tag => Str0}}};
+        {error, unavailable} ->
+            {error, internal_error,
+             "stream '~ts' is not ready to serve this read yet, retry the "
+             "subscription",
+             [rabbit_misc:rs(QName)]}
+    end.
 
 cancel(_Q, #{consumer_tag := ConsumerTag,
              user := ActingUser} = Spec,
@@ -671,23 +678,34 @@ handle_event(_QName, {stream_local_member_change, Pid},
              #stream_client{name = QName,
                             readers = Readers0} = State) ->
     ?LOG_DEBUG("Local member change event for ~tp", [QName]),
-    Readers1 = maps:fold(fun(T, #stream{log = Log0, reader_options = Options} = S0, Acc) ->
-                                 Offset = osiris_log_reader:next_offset(Log0),
-                                 osiris_log_reader:close(Log0),
-                                 CounterSpec = {{?MODULE, QName, self()}, []},
-                                 ?LOG_DEBUG("Re-creating Osiris reader for consumer ~tp at offset ~tp "
-                                            " with options ~tp",
-                                            [T, Offset, Options]),
-                                 {ok, Log1} = osiris:init_reader(Pid, Offset, CounterSpec, Options),
-                                 NextOffset = osiris_log_reader:next_offset(Log1) - 1,
-                                 ?LOG_DEBUG("Registering offset listener at offset ~tp", [NextOffset]),
-                                 osiris:register_offset_listener(Pid, NextOffset),
-                                 S1 = S0#stream{listening_offset = NextOffset,
-                                                log = Log1},
-                                 Acc#{T => S1}
-
-                         end, #{}, Readers0),
-    {ok, State#stream_client{local_pid = Pid, readers = Readers1}, []};
+    try
+        Readers1 = maps:fold(fun(T, #stream{log = Log0, reader_options = Options} = S0, Acc) ->
+                                     Offset = osiris_log_reader:next_offset(Log0),
+                                     osiris_log_reader:close(Log0),
+                                     CounterSpec = {{?MODULE, QName, self()}, []},
+                                     ?LOG_DEBUG("Re-creating Osiris reader for consumer ~tp at offset ~tp "
+                                                " with options ~tp",
+                                                [T, Offset, Options]),
+                                     case osiris:init_reader(Pid, Offset, CounterSpec, Options) of
+                                         {error, unavailable} ->
+                                             throw({stream_local_member_change_unavailable, QName});
+                                         {ok, Log1} ->
+                                             NextOffset = osiris_log_reader:next_offset(Log1) - 1,
+                                             ?LOG_DEBUG("Registering offset listener at offset ~tp", [NextOffset]),
+                                             osiris:register_offset_listener(Pid, NextOffset),
+                                             S1 = S0#stream{listening_offset = NextOffset,
+                                                            log = Log1},
+                                             Acc#{T => S1}
+                                     end
+                             end, #{}, Readers0),
+        {ok, State#stream_client{local_pid = Pid, readers = Readers1}, []}
+    catch
+        throw:{stream_local_member_change_unavailable, QName} ->
+            {protocol_error, internal_error,
+             "stream '~ts' is not ready to serve reads yet after a local "
+             "member change, retry the subscription",
+             [rabbit_misc:rs(QName)]}
+    end;
 handle_event(_QName, eol, #stream_client{name = Name}) ->
     {eol, [{unblock, Name}]};
 handle_event(QName, deleted_replica, State) ->
