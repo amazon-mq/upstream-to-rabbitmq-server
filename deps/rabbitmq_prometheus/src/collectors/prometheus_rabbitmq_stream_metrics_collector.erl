@@ -5,12 +5,14 @@
 %% Copyright (c) 2007-2026 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
 %%
 
-%% Exposes the node-wide histograms osiris records for the sizes of the
-%% entries, sub-batches and chunks written to streams on this node.
+%% Exposes node-wide aggregates of the metrics osiris keeps for streams:
+%% the histograms of entry, sub-batch and chunk sizes, and a fold over
+%% every stream writer on the node for replication health.
 %%
-%% These are aggregates rather than per-stream series, so they are cheap
-%% enough to belong in the default registry: three metric families of a
-%% handful of buckets each, whatever the number of streams.
+%% Everything here is an aggregate rather than a per-stream series, so the
+%% cardinality is fixed whatever the number of streams and these belong in
+%% the default registry. Per-stream stream metrics live in
+%% prometheus_rabbitmq_core_metrics_collector.
 -module(prometheus_rabbitmq_stream_metrics_collector).
 
 -behaviour(prometheus_collector).
@@ -40,13 +42,43 @@ collect_mf(_Registry, Callback) ->
                                 ?METRIC_NAME(Name), Help, Type, Values),
               Callback(MetricsFamily)
       end,
-      histograms()).
+      metrics()).
 
-histograms() ->
+metrics() ->
     try
-        seshat_histogram:format(?GROUP)
+        maps:merge(seshat_histogram:format(?GROUP), writer_metrics())
     catch
         error:badarg ->
             %% the osiris application has not registered its metrics group
             #{}
     end.
+
+writer_metrics() ->
+    {Staleness, Backlog} = fold_writers(),
+    #{replica_staleness_max_seconds =>
+          #{type => gauge,
+            help => "Largest timestamp difference between the last chunk "
+                    "written and the oldest last chunk of any replica, over "
+                    "every stream writer on this node",
+            %% osiris keeps this in milliseconds; Prometheus wants base units
+            values => [Staleness / 1000]},
+      replication_backlog =>
+          #{type => gauge,
+            help => "Offsets written but not yet confirmed by a replica, "
+                    "summed over every stream writer on this node",
+            values => [Backlog]}}.
+
+fold_writers() ->
+    seshat:fold(
+      fun ({osiris_writer, _}, Values, {Staleness, Backlog}) ->
+              {max(Staleness, field(replica_staleness, Values)),
+               Backlog + field(replication_backlog, Values)};
+          (_Id, _Values, Acc) ->
+              %% replicas and replica readers register in this group too
+              Acc
+      end, {0, 0}, ?GROUP, [replica_staleness, replication_backlog]).
+
+%% Tolerate a writer whose fields spec lacks one of these: collect_mf/2
+%% runs on every scrape, and a missing counter is not worth failing over.
+field(Name, Values) ->
+    maps:get(Name, Values, 0).

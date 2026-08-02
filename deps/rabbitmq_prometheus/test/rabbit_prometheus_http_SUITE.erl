@@ -645,6 +645,19 @@ stream_metrics_present(Config) ->
      end || Name <- ["rabbitmq_stream_simple_entry_bytes",
                      "rabbitmq_stream_batch_bytes",
                      "rabbitmq_stream_chunk_bytes"]],
+
+    %% the writer aggregates fold over every stream writer on the node, so
+    %% they are reported as zero rather than absent when there are none
+    [begin
+         ?assertEqual(match, re:run(Body, "^# TYPE " ++ Name ++ " " ++ Type,
+                                    [{capture, none}, multiline])),
+         ?assertEqual(match, re:run(Body, "^# HELP " ++ Name ++ " ",
+                                    [{capture, none}, multiline])),
+         ?assertEqual(match, re:run(Body, "^" ++ Name ++ " [0-9]",
+                                    [{capture, none}, multiline]))
+     end || {Name, Type} <-
+                [{"rabbitmq_stream_replica_staleness_max_seconds", "gauge"},
+                 {"rabbitmq_stream_replication_backlog", "gauge"}]],
     ok.
 
 global_metrics_single_metric_family_test(Config) ->
