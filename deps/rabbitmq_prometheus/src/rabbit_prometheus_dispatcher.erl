@@ -17,6 +17,7 @@ build_dispatcher() ->
         prometheus_rabbitmq_core_metrics_collector,
         prometheus_rabbitmq_global_metrics_collector,
         prometheus_rabbitmq_message_size_metrics_collector,
+        prometheus_rabbitmq_stream_metrics_collector,
         prometheus_rabbitmq_raft_metrics_collector,
         prometheus_rabbitmq_alarm_metrics_collector,
         prometheus_rabbitmq_dynamic_collector,

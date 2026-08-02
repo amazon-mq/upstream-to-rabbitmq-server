@@ -45,14 +45,16 @@ groups() ->
             specific_erlang_metrics_present_test,
             global_metrics_present_test,
             global_metrics_single_metric_family_test,
-            message_size_metrics_present
+            message_size_metrics_present,
+            stream_metrics_present
         ]},
         {per_object_metrics, [], [
             globally_configure_per_object_metrics_test,
             specific_erlang_metrics_present_test,
             global_metrics_present_test,
             global_metrics_single_metric_family_test,
-            message_size_metrics_present
+            message_size_metrics_present,
+            stream_metrics_present
         ]},
         {per_object_endpoint_metrics, [], [
             endpoint_per_object_metrics,
@@ -620,6 +622,30 @@ message_size_metrics_present(Config) ->
     ?assertEqual(match, re:run(Body, "^rabbitmq_message_size_bytes_bucket{protocol=\"amqp10\",le=\"\\+Inf\"}", [{capture, none}, multiline])),
     ?assertEqual(match, re:run(Body, "^rabbitmq_message_size_bytes_count{protocol=\"amqp10\"}", [{capture, none}, multiline])),
     ?assertEqual(match, re:run(Body, "^rabbitmq_message_size_bytes_sum{protocol=\"amqp10\"}", [{capture, none}, multiline])).
+
+%% The osiris histograms are registered when the osiris application
+%% starts, so the families are exposed with zero counts even on a node
+%% that has never written to a stream.
+stream_metrics_present(Config) ->
+    {_Headers, Body} = http_get_with_pal(Config, [], 200),
+
+    [begin
+         ?assertEqual(match, re:run(Body, "^# TYPE " ++ Name ++ " histogram",
+                                    [{capture, none}, multiline])),
+         ?assertEqual(match, re:run(Body, "^# HELP " ++ Name ++ " ",
+                                    [{capture, none}, multiline])),
+         ?assertEqual(match, re:run(Body, "^" ++ Name ++ "_bucket{le=\"100\"}",
+                                    [{capture, none}, multiline])),
+         ?assertEqual(match, re:run(Body, "^" ++ Name ++ "_bucket{le=\"\\+Inf\"}",
+                                    [{capture, none}, multiline])),
+         ?assertEqual(match, re:run(Body, "^" ++ Name ++ "_count ",
+                                    [{capture, none}, multiline])),
+         ?assertEqual(match, re:run(Body, "^" ++ Name ++ "_sum ",
+                                    [{capture, none}, multiline]))
+     end || Name <- ["rabbitmq_stream_simple_entry_bytes",
+                     "rabbitmq_stream_batch_bytes",
+                     "rabbitmq_stream_chunk_bytes"]],
+    ok.
 
 global_metrics_single_metric_family_test(Config) ->
     {_Headers, Body} = http_get_with_pal(Config, [], 200),
