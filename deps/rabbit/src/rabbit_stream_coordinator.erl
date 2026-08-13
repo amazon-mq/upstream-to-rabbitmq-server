@@ -56,7 +56,8 @@
          ra_local_query/1]).
 
 -export([log_overview/1,
-         key_metrics_rpc/1]).
+         key_metrics_rpc/1,
+         is_replica_fresh/2]).
 
 %% for SAC coordinator
 -export([sac_state/1,
@@ -213,18 +214,14 @@ add_replica(Q, Node) when ?is_amqqueue(Q) ->
     %% further replicas to be added
     Pid = amqqueue:get_pid(Q),
     try
-        ReplState0 = osiris_writer:query_replication_state(Pid),
-        {{_, InitTs}, ReplState} = maps:take(node(Pid), ReplState0),
-        {MaxTs, MinTs} = maps:fold(fun (_, {_, Ts}, {Max, Min}) ->
-                                           {max(Ts, Max), min(Ts, Min)}
-                                   end, {InitTs, InitTs}, ReplState),
-        case (MaxTs - MinTs) > ?REPLICA_FRESHNESS_LIMIT_MS of
-            true ->
-                {error, {disallowed, out_of_sync_replica}};
+        Staleness = osiris_writer:replica_staleness(Pid),
+        case is_integer(Staleness) andalso Staleness =< ?REPLICA_FRESHNESS_LIMIT_MS of
             false ->
+                {error, {disallowed, out_of_sync_replica}};
+            true ->
                 Name = rabbit_misc:rs(amqqueue:get_name(Q)),
-                ?LOG_INFO("~ts : adding replica ~ts to ~ts Replication State: ~w",
-                                [?MODULE, Node, Name, ReplState0]),
+                ?LOG_INFO("~ts : adding replica ~ts to ~ts, replica staleness: ~bms",
+                                [?MODULE, Node, Name, Staleness]),
                 StreamId = maps:get(name, amqqueue:get_type_state(Q)),
                 case process_command({add_replica, StreamId, #{node => Node}}) of
                     {ok, Result, _} ->
@@ -237,6 +234,13 @@ add_replica(Q, Node) when ?is_amqqueue(Q) ->
         _:Error ->
             {error, Error}
     end.
+
+-spec is_replica_fresh(integer(), integer()) -> boolean().
+is_replica_fresh(LeaderTs, ReplicaTs)
+  when is_integer(LeaderTs) andalso is_integer(ReplicaTs) ->
+    (LeaderTs - ReplicaTs) =< (?REPLICA_FRESHNESS_LIMIT_MS);
+is_replica_fresh(_, _) ->
+    false.
 
 delete_replica(StreamId, Node) ->
     process_command({delete_replica, StreamId, #{node => Node}}).
