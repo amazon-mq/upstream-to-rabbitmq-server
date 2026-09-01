@@ -3758,7 +3758,8 @@ per_queue_type_disk_alarm(Config) ->
     CQ = <<Prefix/binary, "-classic">>,
     SQ = <<Prefix/binary, "-stream">>,
     {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config),
-    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = CQ}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{queue = CQ, durable = true}),
     #'queue.declare_ok'{} = amqp_channel:call(
                               Ch, #'queue.declare'{
                                      queue = SQ,
@@ -3835,7 +3836,8 @@ per_queue_type_disk_alarm_direct_connection(Config) ->
     amqp_connection:register_blocked_handler(Conn, self()),
 
     {ok, Ch} = amqp_connection:open_channel(Conn),
-    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{queue = QName, durable = true}),
 
     %% Set the alarm using the actual node name so alert_remote fires for
     %% remote pids such as amqp_gen_connection on the CT node.
