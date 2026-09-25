@@ -321,7 +321,9 @@
          %% ever cleared for a key once a scan or release directly confirms
          %% that key holds no claim, so a stale entry can outlive its claim
          %% briefly but a real claim is never missing from it.
-         claimed_consumers = #{} :: #{consumer_key() => true}
+         claimed_consumers = #{} :: #{consumer_key() => true},
+         %% the keys currently in service_queue
+         service_queue_keys = #{} :: #{consumer_key() => true}
         }).
 
 -type config() :: #{name := atom(),
