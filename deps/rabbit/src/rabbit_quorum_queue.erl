@@ -1339,7 +1339,7 @@ consume_error({error, Reason}, QName) ->
      "failed consuming from quorum ~ts: ~tp",
      [rabbit_misc:rs(QName), Reason]};
 consume_error({timeout, RaServerId}, QName) ->
-    {error, internal_error,
+    {error, precondition_failed,
      "timed out consuming from quorum ~ts: ~tp",
      [rabbit_misc:rs(QName), RaServerId]}.
 
