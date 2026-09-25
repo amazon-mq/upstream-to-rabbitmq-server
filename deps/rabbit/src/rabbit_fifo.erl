@@ -1052,11 +1052,19 @@ credit_reply_resend_effect(#?STATE{waiting_consumers = Waiting,
       end, [], maps:merge(Consumers, maps:from_list(Waiting))).
 
 convert_v8_to_v9(#{} = _Meta, StateV8) ->
-    %% v9 added the ingress_bytes_by_node and claimed_consumers fields;
-    %% no v8 consumer can hold a deferred claim, as claiming is new in v9
-    V9State0 = erlang:append_element(
-                 erlang:append_element(StateV8, #{}),
-                 #{}),
+    %% v9 added the ingress_bytes_by_node, claimed_consumers and
+    %% service_queue_keys fields; no v8 consumer can hold a deferred claim,
+    %% as claiming is new in v9
+    V9State00 = erlang:append_element(
+                  erlang:append_element(
+                    erlang:append_element(StateV8, #{}),
+                    #{}),
+                  #{}),
+    #?STATE{service_queue = SQ} = V9State00,
+    V9State0 = V9State00#?STATE{
+                 service_queue_keys =
+                     maps:from_keys([K || {_P, K} <- priority_queue:to_list(SQ)],
+                                    true)},
 
     %% v8's #delayed.deferred map stored a single delayed_key() per token
     %% v9 allows a single token to address multiple messages.
@@ -2001,13 +2009,10 @@ activate_next_consumer(#?STATE{consumers = Cons0,
                                  NextClaims,
                                  Existing#consumer{cfg = NextCCfg})
                        end,
-            #?STATE{service_queue = ServiceQueue} = State0,
-            ServiceQueue1 = maybe_queue_consumer(NextCKey,
-                                                 Consumer,
-                                                 ServiceQueue),
-            State = State0#?STATE{consumers = Cons0#{NextCKey => Consumer},
-                                  service_queue = ServiceQueue1,
-                                  waiting_consumers = Remaining},
+            State = maybe_queue_consumer(
+                      NextCKey, Consumer,
+                      State0#?STATE{consumers = Cons0#{NextCKey => Consumer},
+                                    waiting_consumers = Remaining}),
             Effects = consumer_update_active_effects(State, Consumer,
                                                      true, single_active,
                                                      Effects0),
@@ -2020,16 +2025,13 @@ activate_next_consumer(#?STATE{consumers = Cons0,
             Remaining = tl(Waiting0),
             %% the next consumer is a higher priority and should take over
             %% and this consumer does not have any pending messages
-            #?STATE{service_queue = ServiceQueue} = State0,
-            ServiceQueue1 = maybe_queue_consumer(NextCKey,
-                                                 Consumer,
-                                                 ServiceQueue),
             Cons1 = Cons0#{NextCKey => Consumer},
             Cons = maps:remove(ActiveCKey, Cons1),
             Waiting = add_waiting({ActiveCKey, Active}, Remaining),
-            State = State0#?STATE{consumers = Cons,
-                                  service_queue = ServiceQueue1,
-                                  waiting_consumers = Waiting},
+            State = maybe_queue_consumer(
+                      NextCKey, Consumer,
+                      State0#?STATE{consumers = Cons,
+                                    waiting_consumers = Waiting}),
             Effects1 = consumer_update_active_effects(State, Active,
                                                       false, waiting,
                                                       Effects0),
@@ -3232,6 +3234,7 @@ checkout_one(#{system_time := Ts} = Meta, ExpiredMsg0, InitState0, Effects0) ->
     %% Before checking out any message to any consumer,
     %% first remove all expired messages from the head of the queue.
     {ExpiredMsg, #?STATE{service_queue = SQ0,
+                         service_queue_keys = SQKeys0,
                          messages = Messages0,
                          msg_bytes_checkout = BytesCheckout,
                          msg_bytes_enqueue = BytesEnqueue,
@@ -3242,6 +3245,7 @@ checkout_one(#{system_time := Ts} = Meta, ExpiredMsg0, InitState0, Effects0) ->
     case priority_queue:out(SQ0) of
         {{value, ConsumerKey}, SQ1}
           when is_map_key(ConsumerKey, Cons0) ->
+            SQKeys1 = maps:remove(ConsumerKey, SQKeys0),
             case take_next_msg(InitState) of
                 {Msg, State0} ->
                     %% there are consumers waiting to be serviced
@@ -3257,7 +3261,9 @@ checkout_one(#{system_time := Ts} = Meta, ExpiredMsg0, InitState0, Effects0) ->
                             %% take over, recurse without consumer in service
                             %% queue
                             checkout_one(Meta, ExpiredMsg,
-                                         InitState#?STATE{service_queue = SQ1},
+                                         InitState#?STATE{service_queue = SQ1,
+                                                          service_queue_keys =
+                                                              SQKeys1},
                                          Effects1);
                         #consumer{checked_out = Checked0,
                                   next_msg_id = Next,
@@ -3275,6 +3281,7 @@ checkout_one(#{system_time := Ts} = Meta, ExpiredMsg0, InitState0, Effects0) ->
                             Size = get_header(size, get_msg_header(Msg)),
                             State1 =
                                 State0#?STATE{service_queue = SQ1,
+                                              service_queue_keys = SQKeys1,
                                               msg_bytes_checkout =
                                                   BytesCheckout + Size,
                                               msg_bytes_enqueue =
@@ -3289,10 +3296,14 @@ checkout_one(#{system_time := Ts} = Meta, ExpiredMsg0, InitState0, Effects0) ->
                 empty ->
                     {nochange, ExpiredMsg, InitState, Effects1}
             end;
-        {{value, _ConsumerId}, SQ1} ->
+        {{value, ConsumerKey}, SQ1} ->
             %% consumer was not active but was queued, recurse
             checkout_one(Meta, ExpiredMsg,
-                         InitState#?STATE{service_queue = SQ1}, Effects1);
+                         InitState#?STATE{service_queue = SQ1,
+                                          service_queue_keys =
+                                              maps:remove(ConsumerKey,
+                                                          SQKeys0)},
+                         Effects1);
         {empty, _} ->
             case rabbit_fifo_pq:len(Messages0) of
                 0 ->
@@ -3499,27 +3510,21 @@ update_or_remove_con(_Meta, ConsumerKey,
                  waiting_consumers = add_waiting({ConsumerKey, Con}, Waiting)};
 update_or_remove_con(_Meta, ConsumerKey,
                      #consumer{} = Con,
-                     #?STATE{consumers = Cons,
-                             service_queue = ServiceQueue} = State) ->
-    State#?STATE{consumers = maps:put(ConsumerKey, Con, Cons),
-                 service_queue = maybe_queue_consumer(ConsumerKey, Con,
-                                                      ServiceQueue)}.
+                     #?STATE{consumers = Cons} = State) ->
+    maybe_queue_consumer(ConsumerKey, Con,
+                         State#?STATE{consumers = maps:put(ConsumerKey, Con,
+                                                           Cons)}).
 
 maybe_queue_consumer(Key, #consumer{credit = Credit,
                                     status = up,
                                     cfg = #consumer_cfg{priority = P}},
-                     ServiceQueue)
-  when Credit > 0 ->
-    % TODO: queue:member could surely be quite expensive, however the practical
-    % number of unique consumers may not be large enough for it to matter
-    case priority_queue:member(Key, ServiceQueue) of
-        true ->
-            ServiceQueue;
-        false ->
-            priority_queue:in(Key, P, ServiceQueue)
-    end;
-maybe_queue_consumer(_Key, _Consumer, ServiceQueue) ->
-    ServiceQueue.
+                     #?STATE{service_queue = ServiceQueue,
+                             service_queue_keys = Keys} = State)
+  when Credit > 0 andalso not is_map_key(Key, Keys) ->
+    State#?STATE{service_queue = priority_queue:in(Key, P, ServiceQueue),
+                 service_queue_keys = Keys#{Key => true}};
+maybe_queue_consumer(_Key, _Consumer, State) ->
+    State.
 
 update_consumer(Meta, ConsumerKey, {Tag, Pid}, ConsumerMeta,
                 {Life, Mode} = Spec, Priority, Timeout,
@@ -3634,16 +3639,15 @@ credit_active_consumer(Meta,
                                drain = Drain,
                                consumer_key = ConsumerKey},
                        #consumer{delivery_count = DeliveryCountSnd} = Con0,
-                       #?STATE{consumers = Cons0,
-                               service_queue = ServiceQueue0} = State0) ->
+                       #?STATE{consumers = Cons0} = State0) ->
     LinkCreditSnd = link_credit_snd(DeliveryCountRcv, LinkCreditRcv,
                                     DeliveryCountSnd),
     %% grant the credit
     Con1 = Con0#consumer{drain = Drain,
                          credit = LinkCreditSnd},
-    ServiceQueue = maybe_queue_consumer(ConsumerKey, Con1, ServiceQueue0),
-    State1 = State0#?STATE{service_queue = ServiceQueue,
-                           consumers = maps:update(ConsumerKey, Con1, Cons0)},
+    State1 = maybe_queue_consumer(
+               ConsumerKey, Con1,
+               State0#?STATE{consumers = maps:update(ConsumerKey, Con1, Cons0)}),
     {State2, ok, Effects} = checkout(Meta, State0, State1, []),
 
     #?STATE{consumers = Cons1 = #{ConsumerKey := Con2}} = State2,

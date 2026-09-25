@@ -384,6 +384,22 @@ credit_with_drained_test(Config) ->
                  Effects).
 
 
+credit_after_drain_keeps_single_service_queue_entry_test(Config) ->
+    Cid = {?FUNCTION_NAME, self()},
+    {State1, #{key := CKey}, _} = checkout(Config, ?LINE, Cid,
+                                           {auto, {credited, 0}},
+                                           test_init(test)),
+    {State2, _} = credit(Config, CKey, ?LINE, 1, 0, false, State1),
+    {State3, _, _} = apply(meta(Config, ?LINE),
+                           rabbit_fifo:make_credit(CKey, 5, 0, true), State2),
+    ?assertMatch(#rabbit_fifo{consumers = #{CKey := #consumer{credit = 0}}},
+                 State3),
+    {State4, _} = credit(Config, CKey, ?LINE, 1, 5, false, State3),
+    #rabbit_fifo{service_queue = SQ, service_queue_keys = Keys} = State4,
+    ?assertEqual([CKey], [K || {_, K} <- priority_queue:to_list(SQ)]),
+    ?assertEqual([CKey], maps:keys(Keys)),
+    ok.
+
 credit_and_drain_test(Config) ->
     Ctag = ?FUNCTION_NAME_B,
     Cid = {Ctag, self()},
@@ -4772,6 +4788,33 @@ convert_v7_to_v9_test(Config) ->
 
     ?assertMatch(#consumer{status = {suspected_down, up}},
                  maps:get(Cid1, Consumers)),
+    ok.
+
+convert_v8_to_v9_service_queue_keys_test(Config) ->
+    ConfigV8 = [{machine_version, 8} | Config],
+    Conf = #{name => ?FUNCTION_NAME,
+             queue_resource => rabbit_misc:r("/", queue, ?FUNCTION_NAME_B)},
+    Cid1 = {<<"c1">>, self()},
+    Cid2 = {<<"c2">>, self()},
+    Checkout = fun (Cid) ->
+                       rabbit_fifo_v8:make_checkout(
+                         Cid, {auto, {simple_prefetch, 2}}, #{})
+               end,
+    {S1, {ok, _}, _} = rabbit_fifo_v8:apply(meta(ConfigV8, 1), Checkout(Cid1),
+                                            rabbit_fifo_v8:init(Conf)),
+    {S2, {ok, _}, _} = rabbit_fifo_v8:apply(meta(ConfigV8, 2), Checkout(Cid2),
+                                            S1),
+    {S3, ok, _} = rabbit_fifo:apply(meta(Config, 3), {machine_version, 8, 9},
+                                    S2),
+    {S4, {ok, _}, _} = rabbit_fifo:apply(meta(Config, 4),
+                                         rabbit_fifo:make_checkout(
+                                           Cid2, {auto, {simple_prefetch, 2}},
+                                           #{}),
+                                         S3),
+    #rabbit_fifo{service_queue = SQ, service_queue_keys = Keys} = S4,
+    InQueue = [K || {_, K} <- priority_queue:to_list(SQ)],
+    ?assertEqual(2, length(InQueue)),
+    ?assertEqual(lists:usort(InQueue), lists:sort(maps:keys(Keys))),
     ok.
 
 versioned_query_resolves_frozen_module_test(Config) ->

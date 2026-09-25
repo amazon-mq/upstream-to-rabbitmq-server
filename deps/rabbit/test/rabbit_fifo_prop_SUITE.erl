@@ -86,7 +86,8 @@ all_tests() ->
      two_nodes_same_otp_version,
      two_nodes_different_otp_version,
      ingress_bytes_by_node_accumulation,
-     deferral_claims
+     deferral_claims,
+     service_queue_keys
     ].
 
 groups() ->
@@ -1242,6 +1243,41 @@ deferral_invariant() ->
                            "ActuallyClaiming ~p)",
                            [NoDuplicateKeys, FlagConsistent, Claimed,
                             ActuallyClaiming]),
+                    false
+            end
+    end.
+
+service_queue_keys(_Config) ->
+    Size = 500,
+    run_proper(
+      fun () ->
+              ?FORALL(
+                 SingleActive, boolean(),
+                 begin
+                     InitConf = config(?FUNCTION_NAME, undefined, undefined,
+                                       SingleActive, undefined),
+                     ?FORALL(O, ?LET(Ops, log_gen(Size), expand(Ops, InitConf)),
+                             begin
+                                 Indexes = lists:seq(1, length(O)),
+                                 Entries = lists:zip(Indexes, O),
+                                 run_log(test_init(InitConf), Entries,
+                                         service_queue_keys_invariant()),
+                                 true
+                             end)
+                 end)
+      end, [], Size).
+
+service_queue_keys_invariant() ->
+    fun(#rabbit_fifo{service_queue = SQ, service_queue_keys = Keys}) ->
+            InQueue = [K || {_, K} <- priority_queue:to_list(SQ)],
+            NoDuplicates = length(InQueue) == length(lists:usort(InQueue)),
+            Mirrors = lists:usort(InQueue) == lists:sort(maps:keys(Keys)),
+            case NoDuplicates andalso Mirrors of
+                true ->
+                    true;
+                false ->
+                    ct:pal("service_queue_keys invariant failed: queue ~p "
+                           "keys ~p", [InQueue, Keys]),
                     false
             end
     end.
