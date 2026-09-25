@@ -164,6 +164,7 @@ all_tests() ->
      relaxed_argument_equivalence_checks_on_qq_redeclare,
      consume_invalid_arg_1,
      consume_invalid_arg_2,
+     consume_timeout_closes_only_the_channel,
      consume_invalid_consumer_timeout_negative,
      consume_invalid_consumer_timeout_wrong_type,
      start_queue,
@@ -648,6 +649,47 @@ consume_invalid_arg_2(Config) ->
                                      no_ack = false,
                                      consumer_tag = <<"ctag">>},
                               self())).
+
+consume_timeout_closes_only_the_channel(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    Q = ?config(queue_name, Config),
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(
+                   Config, Server),
+    ?assertEqual({'queue.declare_ok', Q, 0, 0},
+                 declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"quorum">>}])),
+    RaPid = rabbit_ct_broker_helpers:rpc(Config, Server, erlang, whereis,
+                                         [ra_name(Q)]),
+    TickTime = rabbit_ct_broker_helpers:rpc(Config, Server, application,
+                                            get_env, [kernel, net_ticktime]),
+    %% `rabbit_fifo_client:init/2' derives the command timeout from this
+    ok = rabbit_ct_broker_helpers:rpc(Config, Server, application, set_env,
+                                      [kernel, net_ticktime, 1]),
+    {ok, ConsumeCh} = amqp_connection:open_channel(Conn),
+    ok = rabbit_ct_broker_helpers:rpc(Config, Server, sys, suspend, [RaPid]),
+    try
+        ?assertExit(
+           {{shutdown, {server_initiated_close, 406,
+                        <<"PRECONDITION_FAILED - timed out consuming", _/binary>>}},
+            _},
+           amqp_channel:subscribe(ConsumeCh,
+                                  #'basic.consume'{queue = Q,
+                                                   consumer_tag = <<"ctag">>},
+                                  self())),
+        ?assert(is_process_alive(Conn)),
+        ?assertMatch(#'basic.qos_ok'{},
+                     amqp_channel:call(Ch, #'basic.qos'{prefetch_count = 1}))
+    after
+        ok = rabbit_ct_broker_helpers:rpc(Config, Server, sys, resume, [RaPid]),
+        ok = restore_env(Config, Server, kernel, net_ticktime, TickTime)
+    end,
+    rabbit_ct_client_helpers:close_connection(Conn).
+
+restore_env(Config, Server, App, Key, undefined) ->
+    rabbit_ct_broker_helpers:rpc(Config, Server, application, unset_env,
+                                 [App, Key]);
+restore_env(Config, Server, App, Key, {ok, Value}) ->
+    rabbit_ct_broker_helpers:rpc(Config, Server, application, set_env,
+                                 [App, Key, Value]).
 
 consume_invalid_consumer_timeout_negative(Config) ->
     Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
