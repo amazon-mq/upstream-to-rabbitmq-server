@@ -1256,7 +1256,8 @@ service_queue_keys(_Config) ->
                  begin
                      InitConf = config(?FUNCTION_NAME, undefined, undefined,
                                        SingleActive, undefined),
-                     ?FORALL(O, ?LET(Ops, log_gen(Size), expand(Ops, InitConf)),
+                     ?FORALL(O, ?LET(Ops, log_gen_service_queue(Size),
+                                     expand(Ops, InitConf)),
                              begin
                                  Indexes = lists:seq(1, length(O)),
                                  Entries = lists:zip(Indexes, O),
@@ -1856,6 +1857,31 @@ log_gen(Size) ->
                           {1, purge}
                          ]))))).
 
+log_gen_service_queue(Size) ->
+    Nodes = [node(),
+             fakenode@fake,
+             fakenode@fake2
+            ],
+    ?LET(EPids, vector(2, pid_gen(Nodes)),
+         ?LET(CPids, vector(2, pid_gen(Nodes)),
+              resize(Size,
+                     list(
+                       frequency(
+                         [{20, enqueue_gen(oneof(EPids))},
+                          {40, {input_event,
+                                frequency([{10, settle},
+                                           {2, return},
+                                           {2, discard},
+                                           {2, requeue}])}},
+                          {2, checkout_gen(oneof(CPids))},
+                          {2, checkout_mode_gen(oneof(CPids))},
+                          {3, credit_gen(oneof(CPids))},
+                          {1, checkout_cancel_gen(oneof(CPids))},
+                          {1, down_gen(oneof(EPids ++ CPids))},
+                          {1, nodeup_gen(Nodes)},
+                          {1, purge}
+                         ]))))).
+
 log_gen_upgrade_snapshots(Size) ->
     Nodes = [node(),
              fakenode@fake,
@@ -2077,6 +2103,14 @@ checkout_gen(Pid) ->
     %% pid, tag, prefetch
     ?LET(C, {checkout, {binary(), Pid}, choose(1, 10)}, C).
 
+checkout_mode_gen(Pid) ->
+    ?LET(C, {checkout, {oneof([<<"a">>, <<"b">>]), Pid},
+             oneof([{simple_prefetch, choose(1, 10)}, {credited, 0}]),
+             choose(0, 2)}, C).
+
+credit_gen(Pid) ->
+    ?LET(C, {credit, Pid, choose(0, 5), boolean()}, C).
+
 -record(t, {state :: rabbit_fifo:state(),
             index = 1 :: non_neg_integer(), %% raft index
             enqueuers = #{} :: #{pid() => term()},
@@ -2184,6 +2218,37 @@ handle_op({checkout, CId, Prefetch}, #t{consumers  = Cons0} = T) ->
                                               args => []}),
 
             do_apply(Cmd, T#t{consumers = Cons})
+    end;
+handle_op({checkout, CId, Mode, Priority}, #t{consumers = Cons0} = T) ->
+    Cons = case Cons0 of
+               #{CId := _} ->
+                   Cons0;
+               _ ->
+                   maps:put(CId, T#t.index, Cons0)
+           end,
+    Prefetch = case Mode of
+                   {simple_prefetch, P} -> P;
+                   {credited, _} -> 0
+               end,
+    Cmd = rabbit_fifo:make_checkout(CId, {auto, Mode},
+                                    #{ack => true,
+                                      prefetch => Prefetch,
+                                      priority => Priority,
+                                      username => <<"user">>,
+                                      args => []}),
+    do_apply(Cmd, T#t{consumers = Cons});
+handle_op({credit, Pid, Credit, Drain},
+          #t{state = #rabbit_fifo{consumers = Consumers}} = T) ->
+    case [{Key, DeliveryCount}
+          || Key := #consumer{cfg = #consumer_cfg{pid = P,
+                                                  credit_mode = {credited, _}},
+                              delivery_count = DeliveryCount} <- Consumers,
+             P == Pid] of
+        [{Key, DeliveryCount} | _] ->
+            Cmd = rabbit_fifo:make_credit(Key, Credit, DeliveryCount, Drain),
+            do_apply(Cmd, T);
+        [] ->
+            T
     end;
 handle_op({down, Pid, Reason} = Cmd, #t{down = Down} = T) ->
     case Down of
