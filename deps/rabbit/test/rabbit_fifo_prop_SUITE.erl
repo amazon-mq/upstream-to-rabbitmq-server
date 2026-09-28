@@ -2398,7 +2398,7 @@ run_log(InitState, Entries, InvariantFun, MachineVersion)
                                 Invariant(E, Acc, lists:flatten(Efx)),
                                 {Acc, Efx0 ++ Efx};
                             {Acc, _, Efx}  ->
-                                Invariant(E, Acc, lists:flatten(Efx)),
+                                Invariant(E, Acc, [Efx]),
                                 {Acc, Efx0 ++ [Efx]};
                             {Acc, _}  ->
                                 Invariant(E, Acc, []),
