@@ -10,7 +10,8 @@
 
 all() ->
     [
-      {group, parallel_tests}
+      {group, parallel_tests},
+      {group, stale_target}
     ].
 
 groups() ->
@@ -24,6 +25,12 @@ groups() ->
         {overflow_reject_publish, [parallel], OverflowTests},
         dead_queue_rejects,
         mixed_dead_alive_queues_reject
+      ]},
+      {stale_target, [], [
+        fanout_to_live_and_deleted_queue_is_acked,
+        mandatory_publish_to_deleted_queue_is_returned,
+        publish_to_queue_redeclared_as_quorum,
+        publish_to_stream_unknown_to_coordinator
       ]}
     ].
 
@@ -69,7 +76,11 @@ init_per_testcase(policy_resets_to_default = Testcase, Config) ->
 init_per_testcase(Testcase, Config)
         when Testcase == confirms_rejects_conflict;
              Testcase == dead_queue_rejects;
-             Testcase == mixed_dead_alive_queues_reject ->
+             Testcase == mixed_dead_alive_queues_reject;
+             Testcase == fanout_to_live_and_deleted_queue_is_acked;
+             Testcase == mandatory_publish_to_deleted_queue_is_returned;
+             Testcase == publish_to_queue_redeclared_as_quorum;
+             Testcase == publish_to_stream_unknown_to_coordinator ->
     Conn = rabbit_ct_client_helpers:open_unmanaged_connection(Config),
     Conn1 = rabbit_ct_client_helpers:open_unmanaged_connection(Config),
 
@@ -102,6 +113,18 @@ end_per_testcase(mixed_dead_alive_queues_reject = Testcase, Config) ->
     amqp_channel:call(Ch, #'queue.delete'{queue = <<"mixed_dead_alive_queues_reject_dead">>}),
     amqp_channel:call(Ch, #'queue.delete'{queue = <<"mixed_dead_alive_queues_reject_alive">>}),
     amqp_channel:call(Ch, #'exchange.delete'{exchange = <<"mixed_dead_alive_queues_reject">>}),
+    end_per_testcase0(Testcase, Config);
+end_per_testcase(Testcase, Config)
+        when Testcase == fanout_to_live_and_deleted_queue_is_acked;
+             Testcase == mandatory_publish_to_deleted_queue_is_returned;
+             Testcase == publish_to_queue_redeclared_as_quorum;
+             Testcase == publish_to_stream_unknown_to_coordinator ->
+    catch stale_target_utils:stop_routing(Config, 0),
+    _ = rabbit_ct_broker_helpers:rpc(Config, 0, meck, unload, []),
+    {_, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    [amqp_channel:call(Ch, #'queue.delete'{queue = Q})
+     || Q <- [<<"stale_live">>, <<"stale_deleted">>, <<"stale_stream">>]],
+    amqp_channel:call(Ch, #'exchange.delete'{exchange = <<"stale_fanout">>}),
     end_per_testcase0(Testcase, Config).
 
 end_per_testcase0(Testcase, Config) ->
@@ -137,6 +160,118 @@ dead_queue_rejects(Config) ->
     BasicPublish = #'basic.publish'{routing_key = QueueName},
     AmqpMsg = #amqp_msg{payload = <<"HI">>},
     kill_queue_expect_nack(Config, Ch, QueueName, BasicPublish, AmqpMsg, 5).
+
+%% The expected outcomes are the ones that the channel produces when it learns
+%% about a deletion from the queue's `eol'.
+fanout_to_live_and_deleted_queue_is_acked(Config) ->
+    Conn = ?config(conn, Config),
+    ConnRef = erlang:monitor(process, Conn),
+    {ok, Ch} = amqp_connection:open_channel(Conn),
+    X = <<"stale_fanout">>,
+    #'exchange.declare_ok'{} = amqp_channel:call(
+                                 Ch, #'exchange.declare'{exchange = X,
+                                                         type = <<"fanout">>}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{queue = <<"stale_live">>,
+                                                   durable = true}),
+    #'queue.bind_ok'{} = amqp_channel:call(
+                           Ch, #'queue.bind'{queue = <<"stale_live">>,
+                                             exchange = X}),
+    Target = stale_target_utils:create(Config, 0, <<"stale_deleted">>),
+    ok = stale_target_utils:route(Config, 0, Target, [<<"stale_live">>]),
+
+    #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+    amqp_channel:register_confirm_handler(Ch, self()),
+    ok = amqp_channel:call(Ch, #'basic.publish'{exchange = X},
+                           #amqp_msg{payload = <<"m">>}),
+    receive
+        #'basic.ack'{delivery_tag = 1} -> ok;
+        #'basic.nack'{delivery_tag = 1} -> ct:fail(nacked);
+        {'DOWN', ConnRef, process, Conn, Reason} ->
+            ct:fail({connection_closed, Reason})
+    after ?TIMEOUT ->
+        ct:fail(timeout_waiting_for_confirm)
+    end,
+    #'queue.declare_ok'{message_count = 1} =
+        amqp_channel:call(Ch, #'queue.declare'{queue = <<"stale_live">>,
+                                               passive = true}).
+
+mandatory_publish_to_deleted_queue_is_returned(Config) ->
+    Conn = ?config(conn, Config),
+    ConnRef = erlang:monitor(process, Conn),
+    {ok, Ch} = amqp_connection:open_channel(Conn),
+    Target = stale_target_utils:create(Config, 0, <<"stale_deleted">>),
+    ok = stale_target_utils:route(Config, 0, Target, []),
+
+    amqp_channel:register_return_handler(Ch, self()),
+    ok = amqp_channel:call(Ch, #'basic.publish'{routing_key = <<"stale_deleted">>,
+                                                mandatory = true},
+                           #amqp_msg{payload = <<"m">>}),
+    receive
+        {#'basic.return'{reply_code = 312}, _} -> ok;
+        {'DOWN', ConnRef, process, Conn, Reason} ->
+            ct:fail({connection_closed, Reason})
+    after ?TIMEOUT ->
+        ct:fail(timeout_waiting_for_return)
+    end.
+
+publish_to_queue_redeclared_as_quorum(Config) ->
+    Conn = ?config(conn, Config),
+    ConnRef = erlang:monitor(process, Conn),
+    {ok, Ch} = amqp_connection:open_channel(Conn),
+    QueueName = <<"stale_deleted">>,
+    Target = stale_target_utils:create(Config, 0, QueueName),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{queue = QueueName,
+                                                   durable = true,
+                                                   arguments = [{<<"x-queue-type">>,
+                                                                 longstr, <<"quorum">>}]}),
+    ok = stale_target_utils:route(Config, 0, Target, []),
+
+    #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+    amqp_channel:register_confirm_handler(Ch, self()),
+    ok = amqp_channel:call(Ch, #'basic.publish'{routing_key = QueueName},
+                           #amqp_msg{payload = <<"m">>}),
+    receive
+        #'basic.ack'{delivery_tag = 1} -> ok;
+        #'basic.nack'{delivery_tag = 1} -> ok;
+        {'DOWN', ConnRef, process, Conn, Reason} ->
+            ct:fail({connection_closed, Reason})
+    after ?TIMEOUT ->
+        ct:fail(timeout_waiting_for_confirm)
+    end.
+
+%% The stream coordinator no longer knows the stream, while its record is still
+%% visible, which is simulated by making `rabbit_stream_queue:init/1' fail.
+publish_to_stream_unknown_to_coordinator(Config) ->
+    Conn = ?config(conn, Config),
+    ConnRef = erlang:monitor(process, Conn),
+    {ok, Ch} = amqp_connection:open_channel(Conn),
+    QueueName = <<"stale_stream">>,
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{queue = QueueName,
+                                                   durable = true,
+                                                   arguments = [{<<"x-queue-type">>,
+                                                                 longstr, <<"stream">>}]}),
+    rabbit_ct_broker_helpers:setup_meck(Config),
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, meck, new, [rabbit_stream_queue, [no_link, passthrough]]),
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, meck, expect,
+           [rabbit_stream_queue, init, 1, {error, stream_not_found}]),
+
+    #'confirm.select_ok'{} = amqp_channel:call(Ch, #'confirm.select'{}),
+    amqp_channel:register_confirm_handler(Ch, self()),
+    ok = amqp_channel:call(Ch, #'basic.publish'{routing_key = QueueName},
+                           #amqp_msg{payload = <<"m">>}),
+    receive
+        #'basic.ack'{delivery_tag = 1} -> ok;
+        #'basic.nack'{delivery_tag = 1} -> ok;
+        {'DOWN', ConnRef, process, Conn, Reason} ->
+            ct:fail({connection_closed, Reason})
+    after ?TIMEOUT ->
+        ct:fail(timeout_waiting_for_confirm)
+    end.
 
 mixed_dead_alive_queues_reject(Config) ->
     Conn = ?config(conn, Config),

@@ -83,6 +83,8 @@ groups() ->
        server_closes_link_exchange_unsettled,
        link_target_classic_queue_deleted,
        link_target_quorum_queue_deleted,
+       stale_target_fanout_accepted,
+       stale_target_queue_released,
        target_queues_deleted_accepted,
        events,
        sync_get_unsettled_classic_queue,
@@ -2979,6 +2981,70 @@ link_target_queue_deleted(QType, Config) ->
 rabbit_queue_type_deliver_noop(_TargetQs, _Msg, _Opts, QTypeState) ->
     Actions = [],
     {ok, QTypeState, Actions}.
+
+%% The expected outcomes are the ones that `settle_eol0/2' produces for a
+%% deleted queue.
+stale_target_fanout_accepted(Config) ->
+    X = atom_to_binary(?FUNCTION_NAME),
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config),
+    #'exchange.declare_ok'{} = amqp_channel:call(
+                                 Ch, #'exchange.declare'{exchange = X,
+                                                         type = <<"fanout">>}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Ch, #'queue.declare'{queue = <<"stale_live">>,
+                                                   durable = true}),
+    #'queue.bind_ok'{} = amqp_channel:call(
+                           Ch, #'queue.bind'{queue = <<"stale_live">>,
+                                             exchange = X}),
+    {Connection, Session, Sender} = attach_sender(Config, rabbitmq_amqp_address:exchange(X)),
+    Target = stale_target_utils:create(Config, 0, <<"stale_deleted">>),
+    ok = stale_target_utils:route(Config, 0, Target, [<<"stale_live">>]),
+    try
+        ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<1>>, <<"m">>, false)),
+        ok = expect_outcome(<<1>>, accepted)
+    after
+        ok = stale_target_utils:stop_routing(Config, 0)
+    end,
+    #'queue.declare_ok'{message_count = 1} =
+        amqp_channel:call(Ch, #'queue.declare'{queue = <<"stale_live">>,
+                                               passive = true}),
+    #'exchange.delete_ok'{} = amqp_channel:call(Ch, #'exchange.delete'{exchange = X}),
+    ok = rabbit_ct_client_helpers:close_connection_and_channel(Conn, Ch),
+    ok = end_session_sync(Session),
+    ok = close_connection_sync(Connection).
+
+stale_target_queue_released(Config) ->
+    QName = <<"stale_deleted">>,
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config),
+    #'queue.declare_ok'{} = amqp_channel:call(Ch, #'queue.declare'{queue = QName,
+                                                                   durable = true}),
+    {Connection, Session, Sender} = attach_sender(Config, rabbitmq_amqp_address:queue(QName)),
+    Target = stale_target_utils:create(Config, 0, QName),
+    ok = stale_target_utils:route(Config, 0, Target, []),
+    try
+        ok = amqp10_client:send_msg(Sender, amqp10_msg:new(<<1>>, <<"m">>, false)),
+        ok = expect_outcome(<<1>>, released)
+    after
+        ok = stale_target_utils:stop_routing(Config, 0)
+    end,
+    ok = rabbit_ct_client_helpers:close_connection_and_channel(Conn, Ch),
+    ok = end_session_sync(Session),
+    ok = close_connection_sync(Connection).
+
+expect_outcome(Tag, Expected) ->
+    receive
+        {amqp10_disposition, {Expected, Tag}} -> ok;
+        {amqp10_disposition, {Other, Tag}} -> ct:fail({unexpected_outcome, Other})
+    after 30000 ->
+        ct:fail({settled_timeout, Tag})
+    end.
+
+attach_sender(Config, Address) ->
+    {ok, Connection} = amqp10_client:open_connection(connection_config(Config)),
+    {ok, Session} = amqp10_client:begin_session_sync(Connection),
+    {ok, Sender} = amqp10_client:attach_sender_link(Session, <<"test-sender">>, Address),
+    ok = wait_for_credit(Sender),
+    {Connection, Session, Sender}.
 
 target_queues_deleted_accepted(Config) ->
     Q1 = <<"q1">>,

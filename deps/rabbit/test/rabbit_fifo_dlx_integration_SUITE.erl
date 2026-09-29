@@ -60,7 +60,8 @@ groups() ->
        reject_publish_source_queue_max_length_bytes,
        reject_publish_target_classic_queue,
        reject_publish_max_length_target_quorum_queue,
-       target_quorum_queue_delete_create
+       target_quorum_queue_delete_create,
+       target_queue_deleted_after_routing
       ]},
      {cluster_size_3, [],
       [
@@ -197,6 +198,29 @@ expired(Config) ->
     assert_dlx_headers(Headers, <<"expired">>, SourceQ),
     ?assertEqual(1, counted(messages_dead_lettered_expired_total, Config)),
     eventually(?_assertEqual(1, counted(messages_dead_lettered_confirmed_total, Config))).
+
+%% A target queue deleted after routing must not keep the message checked out
+%% from the source queue.
+target_queue_deleted_after_routing(Config) ->
+    {Server, Ch, SourceQ, TargetQ} = declare_topology(Config, []),
+    Target = stale_target_utils:create(Config, 0, ?config(target_queue_2, Config)),
+    ok = stale_target_utils:route(Config, 0, Target, [TargetQ]),
+    try
+        Msg = <<"msg">>,
+        ok = amqp_channel:cast(Ch,
+                               #'basic.publish'{routing_key = SourceQ},
+                               #amqp_msg{props = #'P_basic'{expiration = <<"0">>},
+                                         payload = Msg}),
+        ?awaitMatch({#'basic.get_ok'{}, #amqp_msg{payload = Msg}},
+                    amqp_channel:call(Ch, #'basic.get'{queue = TargetQ}),
+                    30_000),
+        eventually(?_assertEqual([{0, 0}],
+                                 dirty_query([Server], ra_name(SourceQ),
+                                             fun rabbit_fifo:query_stat_dlx/1)),
+                   500, 20)
+    after
+        ok = stale_target_utils:stop_routing(Config, 0)
+    end.
 
 %% Test that at-least-once dead-lettering works for message dead-lettered due to rejected by consumer.
 rejected(Config) ->

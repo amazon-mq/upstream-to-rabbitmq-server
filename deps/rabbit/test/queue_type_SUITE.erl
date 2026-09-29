@@ -29,7 +29,8 @@ all_tests() ->
 
 groups() ->
     [
-     {classic, [], all_tests() ++ [deliver_to_two_deleted_queues,
+     {classic, [], all_tests() ++ [deliver_retry_does_not_duplicate,
+                                   deliver_to_two_deleted_queues,
                                    deliver_with_not_found_for_another_queue]},
      {quorum, [], all_tests()},
      {stream, [],
@@ -272,6 +273,43 @@ deliver_to_deleted_queue(Config) ->
                   #'basic.get_empty'{} -> false
               end
       end, ?TIMEOUT),
+    ok = rabbit_ct_client_helpers:close_connection_and_channel(Conn, Ch).
+
+%% The retry in `rabbit_queue_type:deliver/4' must not deliver twice to a queue
+%% that the failed attempt already delivered to. Here the quorum queue's
+%% `deliver/3' exits after the classic queue has been delivered to.
+%% rabbitmq/rabbitmq-server#17645.
+deliver_retry_does_not_duplicate(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, Server),
+    CQ = ?config(queue_name, Config),
+    QQ = ?config(alt_queue_name, Config),
+    #'queue.declare_ok'{} = declare(Ch, CQ, []),
+    #'queue.declare_ok'{} = declare(Ch, QQ, [{<<"x-queue-type">>, longstr, <<"quorum">>}]),
+    QQName = rabbit_misc:r(<<"/">>, queue, QQ),
+    Targets = rabbit_ct_broker_helpers:rpc(
+                Config, 0, rabbit_db_queue, get_targets,
+                [[rabbit_misc:r(<<"/">>, queue, CQ), QQName]]),
+    rabbit_ct_broker_helpers:setup_meck(Config),
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, meck, new, [rabbit_quorum_queue, [no_link, passthrough]]),
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, meck, expect,
+           [rabbit_quorum_queue, deliver, 3, meck:raise(exit, {not_found, QQName})]),
+    try
+        rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, deliver_to_targets,
+                                     [Targets, #{}])
+    after
+        ok = rabbit_ct_broker_helpers:rpc(Config, 0, meck, unload, [rabbit_quorum_queue])
+    end,
+    MessageCount = fun() ->
+                           #'queue.declare_ok'{message_count = N} =
+                               amqp_channel:call(Ch, #'queue.declare'{queue = CQ,
+                                                                      passive = true}),
+                           N
+                   end,
+    rabbit_ct_helpers:await_condition(fun() -> MessageCount() > 0 end, ?TIMEOUT),
+    rabbit_ct_helpers:consistently(?_assertEqual(1, MessageCount())),
     ok = rabbit_ct_client_helpers:close_connection_and_channel(Conn, Ch).
 
 deliver_to_two_deleted_queues(Config) ->

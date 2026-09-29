@@ -85,6 +85,7 @@ cluster_size_1_tests() ->
      ,message_size_metrics
      ,block_only_publisher
      ,many_qos1_messages
+     ,qos1_publish_to_live_and_deleted_queue
      ,session_expiry
      ,cli_close_all_connections
      ,cli_close_all_user_connections
@@ -1460,6 +1461,33 @@ keepalive(Config) ->
     after ?TIMEOUT -> ct:fail("missing will")
     end,
     ok = emqtt:disconnect(C2).
+
+%% The expected outcome is the one that the deleted queue's `eol' produces.
+qos1_publish_to_live_and_deleted_queue(Config) ->
+    Topic = atom_to_binary(?FUNCTION_NAME),
+    Sub = connect(<<"stale_sub">>, Config),
+    {ok, _, [1]} = emqtt:subscribe(Sub, Topic, qos1),
+    Target = stale_target_utils:create(Config, 0, <<"stale_deleted">>),
+    ok = stale_target_utils:route(Config, 0, Target,
+                                  [<<"mqtt-subscription-stale_subqos1">>]),
+    Pub = connect(<<"stale_pub">>, Config),
+    Self = self(),
+    try
+        spawn(fun() -> Self ! {puback, emqtt:publish(Pub, Topic, <<"m">>, qos1)} end),
+        receive
+            {puback, Result} ->
+                ?assertMatch({ok, #{reason_code_name := success}}, Result)
+        after 10_000 ->
+            ct:fail(no_puback)
+        end
+    after
+        ok = stale_target_utils:stop_routing(Config, 0)
+    end,
+    receive {publish, #{client_pid := Sub, payload := <<"m">>}} -> ok
+    after ?TIMEOUT -> ct:fail(missing_message)
+    end,
+    ok = emqtt:disconnect(Pub),
+    ok = emqtt:disconnect(Sub).
 
 keepalive_turned_off(Config) ->
     %% "A Keep Alive value of zero (0) has the effect of turning off the keep alive mechanism."

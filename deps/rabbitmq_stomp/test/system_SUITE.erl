@@ -72,6 +72,7 @@ groups() ->
         ack_auto_delivery_errors,
         reused_subscription_id_keeps_ack_mode,
         send,
+        send_to_live_and_deleted_queue_receipt,
         send_body_larger_than_max_message_size_is_rejected,
         delete_queue_subscribe,
         temp_destination_queue,
@@ -1218,6 +1219,40 @@ send(Config) ->
       Client1, 'SEND', [{<<"destination">>, ?DESTINATION}], ["hello"]),
 
     {ok, _Client2, _, [<<"hello">>]} = stomp_receive(Client1, 'MESSAGE'),
+    ok.
+
+%% The expected outcome is the one that the deleted queue's `eol' produces.
+send_to_live_and_deleted_queue_receipt(Config) ->
+    Channel = ?config(amqp_channel, Config),
+    Client = ?config(stomp_client, Config),
+    X = <<"stale_fanout">>,
+    Live = <<"stale_live">>,
+    #'exchange.declare_ok'{} = amqp_channel:call(
+                                 Channel, #'exchange.declare'{exchange = X,
+                                                              type = <<"fanout">>}),
+    #'queue.declare_ok'{} = amqp_channel:call(
+                              Channel, #'queue.declare'{queue = Live, durable = true}),
+    #'queue.bind_ok'{} = amqp_channel:call(
+                           Channel, #'queue.bind'{queue = Live, exchange = X}),
+    Target = stale_target_utils:create(Config, 0, <<"stale_deleted">>),
+    ok = stale_target_utils:route(Config, 0, Target, [Live]),
+    try
+        rabbit_stomp_client:send(
+          Client, 'SEND', [{<<"destination">>, <<"/exchange/", X/binary>>},
+                           {<<"receipt">>, <<"r1">>}], ["hello"]),
+        try stomp_receive(Client, 'RECEIPT') of
+            {ok, _Client1, Hdrs, _} ->
+                ?assertEqual(<<"r1">>, maps:get(<<"receipt-id">>, Hdrs))
+        catch error:{badmatch, {error, timeout}} ->
+                ct:fail(no_receipt)
+        end
+    after
+        ok = stale_target_utils:stop_routing(Config, 0)
+    end,
+    #'queue.declare_ok'{message_count = 1} =
+        amqp_channel:call(Channel, #'queue.declare'{queue = Live, passive = true}),
+    #'queue.delete_ok'{} = amqp_channel:call(Channel, #'queue.delete'{queue = Live}),
+    #'exchange.delete_ok'{} = amqp_channel:call(Channel, #'exchange.delete'{exchange = X}),
     ok.
 
 send_body_larger_than_max_message_size_is_rejected(Config) ->
