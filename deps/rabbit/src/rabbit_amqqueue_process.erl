@@ -765,7 +765,24 @@ maybe_reject_or_enqueue(Delivery = #delivery{message = Message},
             end
     end.
 
-settle_seen({true, drop}, _Delivery, State) ->
+settle_seen({true, confirm}, Delivery, State) ->
+    %% The previous leader published the message.
+    {_Confirm, State1} = send_or_record_confirm(Delivery, State),
+    State1;
+%% The previous leader discarded the message, for example by rejecting it
+%% for overflow, delivering it to a consumer that does not ack, or dropping
+%% it under a zero TTL, and the GM discard does not say which. If it
+%% rejected the message and its nack was lost with its node, a confirm
+%% would report as accepted a message this queue does not hold, so nack
+%% it: at worst the publisher sends it again, or its transaction fails.
+settle_seen({true, discarded}, #delivery{confirm    = true,
+                                         sender     = SenderPid,
+                                         msg_seq_no = MsgSeqNo},
+            State = #q{q = Q}) ->
+    ok = rabbit_classic_queue:send_rejection(SenderPid, amqqueue:get_name(Q),
+                                             MsgSeqNo),
+    State;
+settle_seen({true, discarded}, #delivery{confirm = false}, State) ->
     State.
 
 deliver_or_enqueue(Delivery = #delivery{message = Message,

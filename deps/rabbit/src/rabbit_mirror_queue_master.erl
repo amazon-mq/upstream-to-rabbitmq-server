@@ -490,9 +490,9 @@ is_seen(Message, State = #state { seen_status = SS,
     MsgId = mc:get_annotation(id, Message),
     %% Here, we need to deal with the possibility that we're about to
     %% receive a message that we've already seen when we were a mirror
-    %% (we received it via gm). Thus if we do receive such message now
-    %% via the channel, there may be a confirm waiting to issue for
-    %% it.
+    %% (we received it via gm). The verdict tells rabbit_amqqueue_process
+    %% how to settle the channel's copy: {true, confirm} if the message
+    %% was published, {true, discarded} if it was discarded.
 
     %% We will never see {published, ChPid, MsgSeqNo} here.
     case maps:find(MsgId, SS) of
@@ -500,29 +500,27 @@ is_seen(Message, State = #state { seen_status = SS,
             {false, State};
         {ok, published} ->
             %% It already got published when we were a mirror and no
-            %% confirmation is waiting. amqqueue_process will have, in
-            %% its msg_id_to_channel mapping, the entry for dealing
-            %% with the confirm when that comes back in (it's added
-            %% immediately after calling is_duplicate). The msg is
-            %% invalid. We will not see this again, nor will we be
-            %% further involved in confirming this message, so erase.
-            {{true, drop}, State #state { seen_status = maps:remove(MsgId, SS) }};
-        {ok, Disposition}
-          when Disposition =:= confirmed
+            %% confirmation is waiting. rabbit_amqqueue_process confirms
+            %% it at once (transient message or non-durable queue) or
+            %% records it in msg_id_to_channel, and drain_confirmed/1
+            %% returns the MsgId when the underlying BQ confirms the
+            %% message. We will not be further involved in confirming
+            %% this message, so erase.
+            {{true, confirm}, State #state { seen_status = maps:remove(MsgId, SS) }};
+        {ok, confirmed} ->
             %% It got published when we were a mirror via gm, and
             %% confirmed some time after that (maybe even after
             %% promotion), but before we received the publish from the
             %% channel, so couldn't previously know what the
             %% msg_seq_no was (and thus confirm as a mirror). So we
-            %% need to confirm now. As above, amqqueue_process will
-            %% have the entry for the msg_id_to_channel mapping added
-            %% immediately after calling is_duplicate/2.
-          orelse Disposition =:= discarded ->
-            %% Message was discarded while we were a mirror. Confirm now.
-            %% As above, amqqueue_process will have the entry for the
-            %% msg_id_to_channel mapping.
-            {{true, drop}, State #state { seen_status = maps:remove(MsgId, SS),
-                                          confirmed = [MsgId | Confirmed] }}
+            %% need to confirm now. rabbit_amqqueue_process confirms it
+            %% at once or records it in msg_id_to_channel, and the next
+            %% drain_confirmed/1 returns the MsgId for a recorded one.
+            {{true, confirm}, State #state { seen_status = maps:remove(MsgId, SS),
+                                             confirmed = [MsgId | Confirmed] }};
+        {ok, discarded} ->
+            %% Message was discarded while we were a mirror.
+            {{true, discarded}, State #state { seen_status = maps:remove(MsgId, SS) }}
     end.
 
 set_queue_mode(Mode, State = #state { gm                  = GM,
