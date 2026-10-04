@@ -24,6 +24,8 @@
 
 -export([init_with_existing_bq/3, stop_mirroring/1, sync_mirrors/3]).
 
+-export([is_seen/2]).
+
 -behaviour(rabbit_backing_queue).
 
 -include("amqqueue.hrl").
@@ -473,11 +475,18 @@ invoke(Mod, Fun, State = #state { backing_queue       = BQ,
                                   backing_queue_state = BQS }) ->
     State #state { backing_queue_state = BQ:invoke(Mod, Fun, BQS) }.
 
-is_duplicate(Message,
-             State = #state { seen_status         = SS,
-                              backing_queue       = BQ,
-                              backing_queue_state = BQS,
-                              confirmed           = Confirmed }) ->
+%% rabbit_amqqueue_process calls is_seen/2 before this, so only the
+%% underlying BQ is consulted here.
+is_duplicate(Message, State = #state { backing_queue       = BQ,
+                                       backing_queue_state = BQS }) ->
+    {Result, BQS1} = BQ:is_duplicate(Message, BQS),
+    {Result, State #state { backing_queue_state = BQS1 }}.
+
+%% Looks the message up in seen_status. rabbit_amqqueue_process calls
+%% this before its overflow check, and calls is_duplicate/2 only on a
+%% miss.
+is_seen(Message, State = #state { seen_status = SS,
+                                  confirmed   = Confirmed }) ->
     MsgId = mc:get_annotation(id, Message),
     %% Here, we need to deal with the possibility that we're about to
     %% receive a message that we've already seen when we were a mirror
@@ -488,10 +497,7 @@ is_duplicate(Message,
     %% We will never see {published, ChPid, MsgSeqNo} here.
     case maps:find(MsgId, SS) of
         error ->
-            %% We permit the underlying BQ to have a peek at it, but
-            %% only if we ourselves are not filtering out the msg.
-            {Result, BQS1} = BQ:is_duplicate(Message, BQS),
-            {Result, State #state { backing_queue_state = BQS1 }};
+            {false, State};
         {ok, published} ->
             %% It already got published when we were a mirror and no
             %% confirmation is waiting. amqqueue_process will have, in

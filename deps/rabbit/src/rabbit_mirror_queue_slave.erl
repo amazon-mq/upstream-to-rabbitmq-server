@@ -706,7 +706,7 @@ promote_me(From, #state { q                   = Q0,
     %% affect confirmations: if the message was previously pending a
     %% confirmation then it still will be, under the same msg_id. So
     %% as a master, we need to be prepared to filter out the
-    %% publication of said messages from the channel (is_duplicate
+    %% publication of said messages from the channel (is_seen
     %% (thus such requeued messages must remain in the msg_id_status
     %% (MS) which becomes seen_status (SS) in the master)).
     %%

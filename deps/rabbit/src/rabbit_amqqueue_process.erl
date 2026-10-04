@@ -705,15 +705,35 @@ attempt_delivery(Delivery = #delivery{sender  = SenderPid,
 
 maybe_deliver_or_enqueue(Delivery = #delivery{message = Message},
                          Delivered,
-                         State = #q{overflow            = Overflow,
-                                    backing_queue       = BQ,
-                                    backing_queue_state = BQS,
-                                    dlx                 = DLX,
-                                    dlx_routing_key     = RK}) ->
+                         State = #q{backing_queue       = rabbit_mirror_queue_master,
+                                    backing_queue_state = BQS}) ->
     send_mandatory(Delivery), %% must do this before confirms
+    %% A promoted leader can receive a channel's copy of a message that
+    %% is in its seen_status because it arrived via GM first. Look it up
+    %% before the overflow check: rejecting such a copy can call
+    %% BQ:discard/4, whose seen_status assertion crashes the queue
+    %% process.
+    case rabbit_mirror_queue_master:is_seen(Message, BQS) of
+        {false, BQS1} ->
+            maybe_reject_or_enqueue(Delivery, Delivered,
+                                    State#q{backing_queue_state = BQS1});
+        {Seen, BQS1} ->
+            settle_seen(Seen, Delivery, State#q{backing_queue_state = BQS1})
+    end;
+maybe_deliver_or_enqueue(Delivery, Delivered, State) ->
+    send_mandatory(Delivery), %% must do this before confirms
+    maybe_reject_or_enqueue(Delivery, Delivered, State).
+
+maybe_reject_or_enqueue(Delivery = #delivery{message = Message},
+                        Delivered,
+                        State = #q{overflow            = Overflow,
+                                   backing_queue       = BQ,
+                                   backing_queue_state = BQS,
+                                   dlx                 = DLX,
+                                   dlx_routing_key     = RK}) ->
     case {will_overflow(Delivery, State), Overflow} of
         {true, 'reject-publish'} ->
-            %% Drop publish and nack to publisher
+            %% Drop publish, and nack it if the publisher uses confirms or a transaction
             send_reject_publish(Delivery, Delivered, State);
         {true, 'reject-publish-dlx'} ->
             %% Publish to DLX
@@ -728,7 +748,7 @@ maybe_deliver_or_enqueue(Delivery = #delivery{message = Message},
               fun () -> rabbit_global_counters:messages_dead_lettered(maxlen, rabbit_classic_queue,
                                                                       disabled, 1)
               end),
-            %% Drop publish and nack to publisher
+            %% Drop publish, and nack it if the publisher uses confirms or a transaction
             send_reject_publish(Delivery, Delivered, State);
         _ ->
             {IsDuplicate, BQS1} = BQ:is_duplicate(Message, BQS),
@@ -736,7 +756,7 @@ maybe_deliver_or_enqueue(Delivery = #delivery{message = Message},
             case IsDuplicate of
                 true -> State1;
                 {true, drop} -> State1;
-                %% Drop publish and nack to publisher
+                %% Drop publish, and nack it if the publisher uses confirms or a transaction
                 {true, reject} ->
                     send_reject_publish(Delivery, Delivered, State1);
                 %% Enqueue and maybe drop head later
@@ -744,6 +764,9 @@ maybe_deliver_or_enqueue(Delivery = #delivery{message = Message},
                     deliver_or_enqueue(Delivery, Delivered, State1)
             end
     end.
+
+settle_seen({true, drop}, _Delivery, State) ->
+    State.
 
 deliver_or_enqueue(Delivery = #delivery{message = Message,
                                         sender  = SenderPid,
