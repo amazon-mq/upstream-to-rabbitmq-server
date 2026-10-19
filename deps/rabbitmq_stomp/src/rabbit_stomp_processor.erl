@@ -359,6 +359,7 @@ process_connect(Implicit, Frame,
       fun(StateN) ->
               Res1 = maybe
                   ok ?= check_node_connection_limit(),
+                  ok ?= check_total_connection_limit(),
                   {ok, Version} ?= negotiate_version(Frame),
                   ProtoVer = stomp_proto_ver(Version),
                   FT = frame_transformer(Version),
@@ -441,6 +442,10 @@ process_connect(Implicit, Frame,
                   {error, node_connection_limit_exceeded} ->
                       error("Bad CONNECT",
                             "Connection refused: node connection limit reached",
+                            State);
+                  {error, total_node_connection_limit_exceeded} ->
+                      error("Bad CONNECT",
+                            "Connection refused: total node connection limit reached",
                             State)
               end,
               case {Res1, Implicit} of
@@ -2205,6 +2210,16 @@ check_vhost_access(VHost, User = #user{username = Username}, PeerIp) ->
             ?LOG_ERROR("STOMP connection failed: access refused for user '~ts' to vhost '~ts'",
                        [Username, VHost]),
             {error, not_allowed, Username, VHost}
+    end.
+
+check_total_connection_limit() ->
+    case rabbit_networking:over_total_connection_limit() of
+        false ->
+            ok;
+        {true, Limit} ->
+            ?LOG_ERROR("STOMP connection failed: total node connection limit ~b is reached",
+                       [Limit]),
+            {error, total_node_connection_limit_exceeded}
     end.
 
 check_node_connection_limit() ->
