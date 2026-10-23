@@ -39,6 +39,7 @@ groups() ->
                        rejects_when_count_equals_limit,
                        limit_zero_rejects_first_connection,
                        count_decrements_on_disconnect,
+                       total_limit_refuses_stomp,
                        prop_admits_min_attempts_limit
                       ]}
     ].
@@ -78,6 +79,7 @@ init_per_testcase(Testcase, Config) ->
 
 end_per_testcase(Testcase, Config) ->
     unset_max_connections(Config),
+    set_total_limit(Config, infinity),
     await_local_count(Config, 0),
     rabbit_ct_helpers:testcase_finished(Config, Testcase).
 
@@ -158,6 +160,19 @@ count_decrements_on_disconnect(Config) ->
     await_local_count(Config, 0),
     ok.
 
+total_limit_refuses_stomp(Config) ->
+    set_total_limit(Config, 1),
+    {ok, S1} = connect(Config, plain),
+    {ok, Sock} = open_socket(Config, plain),
+    ok = gen_tcp:send(Sock, connect_frame()),
+    {ok, Data} = gen_tcp:recv(Sock, 0, ?TIMEOUT),
+    ?assertEqual(<<"ERROR">>, parse_command(Data)),
+    ?assertNotEqual(nomatch, binary:match(Data, <<"total node connection limit">>)),
+    gen_tcp:close(Sock),
+    close(S1, plain),
+    await_local_count(Config, 0),
+    ok.
+
 %% For any (Limit, N), N CONNECT attempts admit min(N, Limit), or N if
 %% Limit is infinity.
 prop_admits_min_attempts_limit(Config) ->
@@ -188,6 +203,11 @@ set_max_connections(Config, Value) ->
     ok = rabbit_ct_broker_helpers:rpc(
            Config, 0, application, set_env,
            [rabbitmq_stomp, max_connections, Value]).
+
+set_total_limit(Config, Value) ->
+    ok = rabbit_ct_broker_helpers:rpc(
+           Config, 0, application, set_env,
+           [rabbit, connection_max_per_node, Value]).
 
 unset_max_connections(Config) ->
     ok = rabbit_ct_broker_helpers:rpc(

@@ -80,9 +80,10 @@ total_connection_limit_spans_protocols(Config) ->
     {error, not_allowed} =
         rabbit_ct_client_helpers:open_unmanaged_connection(Config, 0),
     {MqttRefused, Connect} =
-        util:start_client(<<"total-limit-mqtt-refused">>, Config, 0, []),
+        util:start_client(<<"total-limit-mqtt-refused">>, Config, 0,
+                          [{proto_ver, v5}]),
     true = unlink(MqttRefused),
-    ?assertMatch({error, _}, Connect(MqttRefused)),
+    ?assertMatch({error, {quota_exceeded, _}}, Connect(MqttRefused)),
 
     ok = emqtt:disconnect(Mqtt),
     ok = rabbit_ct_client_helpers:close_connection(Amqp),
