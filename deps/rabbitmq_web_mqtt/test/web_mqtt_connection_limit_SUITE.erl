@@ -13,7 +13,8 @@
         [connect/3]).
 
 all() ->
-    [node_connection_limit_cross_transport].
+    [node_connection_limit_cross_transport,
+     total_connection_limit_cross_transport].
 
 suite() ->
     [{timetrap, {minutes, 2}}].
@@ -66,4 +67,30 @@ node_connection_limit_cross_transport(BaseConfig) ->
         ok = rabbit_ct_broker_helpers:rpc(
                BaseConfig, 0, application, unset_env,
                [rabbitmq_mqtt, max_connections])
+    end.
+
+total_connection_limit_cross_transport(BaseConfig) ->
+    Config = [{websocket, true} | BaseConfig],
+    ok = rabbit_ct_broker_helpers:rpc(
+           BaseConfig, 0, application, set_env,
+           [rabbit, connection_max_per_node, 2]),
+    try
+        C1 = connect(<<"plain-mqtt-total">>, BaseConfig, [{ack_timeout, 1}]),
+        C2 = connect(<<"web-mqtt-total">>, Config, [{ack_timeout, 1}]),
+        {ok, C3} = emqtt:start_link(
+                     [{host, "localhost"},
+                      {port, rabbit_ct_broker_helpers:get_node_config(
+                               Config, 0, tcp_port_web_mqtt)},
+                      {proto_ver, v5},
+                      {clientid, <<"web-mqtt-total-2">>},
+                      {ws_path, "/ws"},
+                      {ack_timeout, 1}]),
+        unlink(C3),
+        ?assertMatch({error, {quota_exceeded, _}}, emqtt:ws_connect(C3)),
+        ok = emqtt:disconnect(C1),
+        ok = emqtt:disconnect(C2)
+    after
+        ok = rabbit_ct_broker_helpers:rpc(
+               BaseConfig, 0, application, set_env,
+               [rabbit, connection_max_per_node, infinity])
     end.
