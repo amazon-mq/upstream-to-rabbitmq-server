@@ -1339,6 +1339,7 @@ handle_method0(#'connection.open'{virtual_host = VHost},
                            sock             = Sock,
                            throttle         = Throttle}) ->
     ok = is_over_node_connection_limit(RanchRef),
+    ok = is_over_total_connection_limit(),
     ok = is_over_vhost_connection_limit(VHost, User),
     ok = is_over_user_connection_limit(User),
     ok = rabbit_access_control:check_vhost_access(User, VHost, {socket, Sock}, #{}),
@@ -1451,6 +1452,16 @@ is_over_node_connection_limit(RanchRef) ->
                                             "node connection limit (~tp) is reached",
                                             [Limit])
             end
+    end.
+
+is_over_total_connection_limit() ->
+    case rabbit_networking:over_total_connection_limit() of
+        false -> ok;
+        {true, Limit} ->
+            rabbit_misc:protocol_error(not_allowed,
+                                    "connection refused: "
+                                    "total node connection limit (~tp) is reached",
+                                    [Limit])
     end.
 
 is_over_vhost_connection_limit(VHostPath, User) ->

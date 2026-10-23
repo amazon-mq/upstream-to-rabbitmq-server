@@ -54,7 +54,9 @@
 
 -export([
     local_connections/0,
-    local_non_amqp_connections/0
+    local_non_amqp_connections/0,
+    total_connection_count/0,
+    over_total_connection_limit/0
 ]).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
@@ -545,6 +547,46 @@ local_connections() ->
     Amqp091Pids = pg:which_groups(pg_scope_amqp091_connection()),
     Amqp10Pids = rabbit_amqp_reader:local_connections(),
     Amqp10Pids ++ Amqp091Pids.
+
+%% Messaging listeners only: the cap never refuses management/Prometheus HTTP, so
+%% counting them would let monitoring traffic displace clients below the limit.
+-define(TOTAL_LIMIT_PROTOCOLS,
+        [amqp, 'amqp/ssl', 'http/web-amqp', 'https/web-amqp',
+         mqtt, 'mqtt/ssl', 'http/web-mqtt', 'https/web-mqtt',
+         stomp, 'stomp/ssl', 'http/web-stomp', 'https/web-stomp',
+         stream, 'stream/ssl']).
+
+-spec total_connection_count() -> non_neg_integer().
+total_connection_count() ->
+    lists:foldl(fun(Protocol, Acc) -> Acc + protocol_connection_count(Protocol) end,
+                0, ?TOTAL_LIMIT_PROTOCOLS).
+
+protocol_connection_count(Protocol) ->
+    lists:foldl(fun(Ref, Acc) ->
+                        %% A listener stopped between the ETS lookup and here leaves
+                        %% a ref ranch:info/1 rejects; must not crash the accept.
+                        try ranch:info(Ref) of
+                            #{active_connections := Count} -> Acc + Count
+                        catch
+                            _:_ -> Acc
+                        end
+                end, 0, ranch_refs_of_protocol(Protocol)).
+
+%% A negative limit refuses every connection, matching the per-listener
+%% `connection_max` check in rabbit_reader.
+-spec over_total_connection_limit() -> false | {true, integer()}.
+over_total_connection_limit() ->
+    case application:get_env(rabbit, connection_max_per_node, infinity) of
+        infinity ->
+            false;
+        Limit when is_integer(Limit) ->
+            case total_connection_count() > Limit of
+                true -> {true, Limit};
+                false -> false
+            end;
+        _ ->
+            false
+    end.
 
 -spec register_non_amqp_connection(pid()) -> ok.
 

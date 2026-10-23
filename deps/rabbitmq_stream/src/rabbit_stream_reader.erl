@@ -1630,6 +1630,7 @@ handle_frame_pre_auth(Transport,
     {Connection1, State1} =
         maybe
             ok ?= check_node_connection_limit(RanchRef),
+            ok ?= check_total_connection_limit(),
             ok ?= check_vhost_alive(VirtualHost),
             ok ?= check_vhost_connection_limit(VirtualHost),
             ok ?= check_user_connection_limit(Username),
@@ -4458,6 +4459,15 @@ retry_sac_call(Call, N) ->
             retry_sac_call(Call, N - 1);
         R ->
             R
+    end.
+
+check_total_connection_limit() ->
+    case rabbit_networking:over_total_connection_limit() of
+        false ->
+            ok;
+        {true, Limit} ->
+            {error, io_lib:format("connection refused: total node connection "
+                                  "limit (~tp) is reached", [Limit])}
     end.
 
 check_node_connection_limit(undefined) ->

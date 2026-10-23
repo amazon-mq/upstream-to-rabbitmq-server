@@ -506,6 +506,7 @@ handle_connection_frame(
     ok = check_user_loopback(State0),
     %% Enforced before per-vhost and per-user limits for efficiency.
     ok = check_node_connection_limit(RanchRef),
+    ok = check_total_connection_limit(),
     ok = check_vhost_exists(Vhost, State0),
     ok = check_vhost_alive(Vhost),
     ok = rabbit_access_control:check_vhost_access(User, Vhost, {socket, Sock}, #{}),
@@ -1068,6 +1069,20 @@ check_node_connection_limit(RanchRef) ->
                       "connection refused: node connection limit (~p) is reached",
                       [Limit])
             end
+    end.
+
+%% Unconditional (no Ranch ref): also covers AMQP-over-WebSockets, counted under
+%% its own Web/WSS listener.
+-spec check_total_connection_limit() -> ok.
+check_total_connection_limit() ->
+    case rabbit_networking:over_total_connection_limit() of
+        false ->
+            ok;
+        {true, Limit} ->
+            protocol_error(
+              ?V_1_0_AMQP_ERROR_RESOURCE_LIMIT_EXCEEDED,
+              "connection refused: total node connection limit (~p) is reached",
+              [Limit])
     end.
 
 check_vhost_connection_limit(Vhost, Username) ->

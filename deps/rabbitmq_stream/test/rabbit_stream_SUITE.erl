@@ -74,6 +74,7 @@ groups() ->
        vhost_connection_limit,
        user_connection_limit,
        node_connection_limit,
+       total_node_connection_limit,
        connection_should_be_closed_on_token_expiry,
        should_receive_metadata_update_after_update_secret,
        store_offset_requires_read_access,
@@ -244,6 +245,10 @@ init_per_testcase(node_connection_limit = TestCase, Config) ->
     rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env, [rabbitmq_stream, max_connections, 0]),
     rabbit_ct_helpers:testcase_started(Config, TestCase);
 
+init_per_testcase(total_node_connection_limit = TestCase, Config) ->
+    rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env, [rabbit, connection_max_per_node, 0]),
+    rabbit_ct_helpers:testcase_started(Config, TestCase);
+
 init_per_testcase(store_offset_requires_read_access = TestCase, Config) ->
   ok = rabbit_ct_broker_helpers:add_user(Config, <<"test">>),
   rabbit_ct_helpers:testcase_started(Config, TestCase);
@@ -309,6 +314,9 @@ end_per_testcase(user_connection_limit = TestCase, Config) ->
     rabbit_ct_helpers:testcase_finished(Config, TestCase);
 end_per_testcase(node_connection_limit = TestCase, Config) ->
     rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env, [rabbitmq_stream, max_connections, infinity]),
+    rabbit_ct_helpers:testcase_finished(Config, TestCase);
+end_per_testcase(total_node_connection_limit = TestCase, Config) ->
+    rabbit_ct_broker_helpers:rpc(Config, 0, application, set_env, [rabbit, connection_max_per_node, infinity]),
     rabbit_ct_helpers:testcase_finished(Config, TestCase);
 end_per_testcase(store_offset_requires_read_access = TestCase, Config) ->
     ok = rabbit_ct_broker_helpers:delete_user(Config, <<"test">>),
@@ -1267,6 +1275,12 @@ user_connection_limit(Config) ->
     ok.
 
 node_connection_limit(Config) ->
+    open_is_refused(Config).
+
+total_node_connection_limit(Config) ->
+    open_is_refused(Config).
+
+open_is_refused(Config) ->
     T = gen_tcp,
     Port = get_port(T, Config),
     Opts = get_opts(T),

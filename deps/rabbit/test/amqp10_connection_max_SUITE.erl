@@ -26,6 +26,7 @@ groups() ->
        node_limit_infinity_allows_amqp10,
        node_limit_room_after_close,
        node_connection_limit_shared_with_amqp091,
+       total_connection_limit_amqp10,
        amqp10_connection_is_tracked
       ]}].
 
@@ -55,10 +56,12 @@ end_per_group(_Group, Config) ->
 
 init_per_testcase(Testcase, Config) ->
     set_node_limit(Config, infinity),
+    set_total_limit(Config, infinity),
     rabbit_ct_helpers:testcase_started(Config, Testcase).
 
 end_per_testcase(Testcase, Config) ->
     set_node_limit(Config, infinity),
+    set_total_limit(Config, infinity),
     rabbit_ct_helpers:testcase_finished(Config, Testcase).
 
 %% -------------------------------------------------------------------
@@ -104,6 +107,15 @@ node_connection_limit_shared_with_amqp091(Config) ->
     rabbit_ct_client_helpers:close_connection(C091),
     ok.
 
+total_connection_limit_amqp10(Config) ->
+    set_total_limit(Config, 1),
+    C1 = open_amqp10_ok(Config),
+    {refused, _} = open_amqp10(Config),
+    set_total_limit(Config, 2),
+    C2 = open_amqp10_ok(Config),
+    [amqp_utils:close_connection_sync(C) || C <- [C1, C2]],
+    ok.
+
 amqp10_connection_is_tracked(Config) ->
     ok = event_recorder:start(Config),
     try
@@ -127,6 +139,11 @@ set_node_limit(Config, Limit) ->
     ok = rabbit_ct_broker_helpers:rpc(Config, 0,
                                       application, set_env,
                                       [rabbit, connection_max, Limit]).
+
+set_total_limit(Config, Limit) ->
+    ok = rabbit_ct_broker_helpers:rpc(Config, 0,
+                                      application, set_env,
+                                      [rabbit, connection_max_per_node, Limit]).
 
 open_amqp10_ok(Config) ->
     {ok, Conn} = open_amqp10(Config),
