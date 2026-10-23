@@ -26,6 +26,7 @@
          reset/1,
          reset_removes_things/1,
          reset_in_minority/1,
+         init_after_reset_times_out/1,
          force_boot/1,
          status_with_alarm/1,
          pid_file_and_await_node_startup/1,
@@ -72,6 +73,7 @@ groups() ->
                              reset,
                              reset_removes_things,
                              reset_in_minority,
+                             init_after_reset_times_out,
                              force_boot,
                              status_with_alarm,
                              pid_file_and_await_node_startup,
@@ -499,6 +501,24 @@ reset_in_minority(Config) ->
     is_in_minority(reset(Config, Rabbit)),
 
     ok.
+
+init_after_reset_times_out(Config) ->
+    [Rabbit, _Hare] = cluster_members(Config),
+
+    ok = stop_app(Config, Rabbit),
+    ok = reset(Config, Rabbit),
+
+    ok = rpc:call(Rabbit, application, set_env,
+                  [rabbit, khepri_leader_wait_retry_timeout, 2000]),
+    ?assertEqual(
+       {error, timeout},
+       rabbit_ct_broker_helpers:rpc(
+         Config, Rabbit, rabbit_khepri, init, [false], 30_000)),
+
+    ok = rpc:call(Rabbit, application, unset_env,
+                  [rabbit, khepri_leader_wait_retry_timeout]),
+    ok = start_app(Config, Rabbit),
+    assert_cluster_status({[Rabbit], [Rabbit]}, [Rabbit]).
 
 is_in_minority(Ret) ->
     ?assertMatch({error, 75, _}, Ret),

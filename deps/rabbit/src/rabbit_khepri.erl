@@ -343,10 +343,24 @@ retry_timeout() ->
 %% Finally, it requests the deletion of transient queues on this node.
 
 init(IsVirgin) ->
+    Timeout = retry_timeout(),
+    Deadline = erlang:monotonic_time(millisecond) + Timeout,
+    init(IsVirgin, Timeout, Deadline).
+
+init(IsVirgin, Timeout, Deadline) ->
     case members() of
         [] ->
-            timer:sleep(1000),
-            init(IsVirgin);
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true ->
+                    timer:sleep(1000),
+                    init(IsVirgin, Timeout, Deadline);
+                false ->
+                    ?LOG_ERROR(
+                       "Khepri-based " ?RA_FRIENDLY_NAME " has no known "
+                       "members after waiting ~tb ms", [Timeout],
+                       #{domain => ?RMQLOG_DOMAIN_DB}),
+                    {error, timeout}
+            end;
         Members ->
             ?LOG_NOTICE(
                "Found the following metadata store members: ~p", [Members],
