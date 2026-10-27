@@ -1002,8 +1002,22 @@ end}.
  end
 }.
 
+%% Set the max permissible number of client connections per node, shared by
+%% AMQP 0-9-1, AMQP 1.0, MQTT, STOMP and stream, including TLS, Web MQTT, Web
+%% STOMP and each WebSocket on an HTTP/2 connection. A connection counts from
+%% the moment it is accepted, or for Web MQTT and Web STOMP from the WebSocket
+%% upgrade, before the client authenticates. `infinity` means "no limit".
+%%
+%% A connection refused by another check, such as `stream.max_connections` or a
+%% failed login, counts until it closes. Connections arriving together near the
+%% limit can all be refused while a place is free. An MQTT client that
+%% reconnects with the client ID of a stale connection is refused while the
+%% stale connection still counts.
+%%
+%% {connection_max_per_node, infinity},
+
 {mapping, "connection_max_per_node", "rabbit.connection_max_per_node",
-  [{datatype, [{atom, infinity}, integer]}]}.
+  [{datatype, [{atom, infinity}, integer]}, {validators, ["non_negative_integer"]}]}.
 
 {translation, "rabbit.connection_max_per_node",
  fun(Conf) ->
