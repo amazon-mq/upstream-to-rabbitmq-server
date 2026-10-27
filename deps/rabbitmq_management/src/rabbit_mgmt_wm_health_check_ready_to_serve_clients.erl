@@ -63,7 +63,7 @@ check() ->
                     Limit = rabbit_misc:get_env(rabbit, connection_max, infinity),
                     case ActiveConns < Limit of
                         true ->
-                            ok;
+                            rabbit_mgmt_wm_health_check_below_node_connection_limit:check_connection_max_per_node();
                         false ->
                             ?LOG_WARNING(
                               "Node connection limit is reached. Active "

@@ -10,6 +10,7 @@
 -export([init/2]).
 -export([to_json/2, content_types_provided/2]).
 -export([variances/2]).
+-export([check_connection_max_per_node/0]).
 
 -include_lib("kernel/include/logger.hrl").
 
@@ -36,23 +37,29 @@ to_json(ReqData, Context) ->
     Limit = rabbit_misc:get_env(rabbit, connection_max, infinity),
     case ActiveConns < Limit of
         true ->
-            rabbit_mgmt_util:reply(#{status => ok}, ReqData, Context);
+            case check_connection_max_per_node() of
+                ok ->
+                    rabbit_mgmt_util:reply(#{status => ok}, ReqData, Context);
+                {error, Body} ->
+                    failure(Body, ReqData, Context)
+            end;
         false ->
             ?LOG_WARNING(
               "Node connection limit is reached. Active connections: ~w, "
               "limit: ~w",
               [ActiveConns, Limit]),
-            Body = #{
-                status => failed,
-                reason => <<"node connection limit is reached">>
-            },
-            {Response, ReqData1, Context1} = rabbit_mgmt_util:reply(
-                                               Body, ReqData, Context),
-            {stop,
-             cowboy_req:reply(
-               ?HEALTH_CHECK_FAILURE_STATUS, #{}, Response, ReqData1),
-             Context1}
+            failure(#{status => failed,
+                      reason => <<"node connection limit is reached">>},
+                    ReqData, Context)
     end.
+
+failure(Body, ReqData, Context) ->
+    {Response, ReqData1, Context1} = rabbit_mgmt_util:reply(
+                                       Body, ReqData, Context),
+    {stop,
+     cowboy_req:reply(
+       ?HEALTH_CHECK_FAILURE_STATUS, #{}, Response, ReqData1),
+     Context1}.
 
 protocol_connection_count(Protocol) ->
     Refs = rabbit_networking:ranch_refs_of_protocol(Protocol),
@@ -61,3 +68,16 @@ protocol_connection_count(Protocol) ->
               #{active_connections := Count} = ranch:info(Ref),
               Acc + Count
       end, 0, Refs).
+
+check_connection_max_per_node() ->
+    case amq_connection_limit:at_limit() of
+        false ->
+            ok;
+        {true, Count, Limit} ->
+            ?LOG_WARNING(
+              "Total node connection limit is reached. Connections: ~w, "
+              "limit: ~w", [Count, Limit]),
+            {error, #{status => failed,
+                      reason => <<"total node connection limit is reached">>,
+                      connections => Count}}
+    end.

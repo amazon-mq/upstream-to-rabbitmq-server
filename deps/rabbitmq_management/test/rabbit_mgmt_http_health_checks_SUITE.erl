@@ -10,6 +10,7 @@
 -include("rabbit_mgmt.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
 -include_lib("rabbitmq_ct_helpers/include/rabbit_mgmt_test.hrl").
 
 -import(rabbit_mgmt_test_util, [http_get/3,
@@ -64,6 +65,8 @@ all_tests() -> [
                 is_in_service_test,
                 below_node_connection_limit_test,
                 ready_to_serve_clients_test,
+                below_connection_max_per_node_test,
+                ready_to_serve_clients_connection_max_per_node_test,
                 reached_target_cluster_size_test
                ].
 
@@ -768,6 +771,39 @@ ready_to_serve_clients_test(Config) ->
     rabbit_ct_broker_helpers:rpc(
       Config, 0, application, set_env, [rabbit, connection_max, infinity]),
 
+    passed.
+
+below_connection_max_per_node_test(Config) ->
+    connection_max_per_node_test(Config, "/health/checks/below-node-connection-limit").
+
+ready_to_serve_clients_connection_max_per_node_test(Config) ->
+    connection_max_per_node_test(Config, "/health/checks/ready-to-serve-clients").
+
+connection_max_per_node_test(Config, Path) ->
+    rabbit_ct_client_helpers:close_channels_and_connection(Config, 0),
+    ?awaitMatch(0, rabbit_ct_broker_helpers:rpc(
+                     Config, 0, amq_connection_limit, count, []), 30000),
+    Limit = 3,
+    rabbit_ct_broker_helpers:rpc(
+      Config, 0, application, set_env, [rabbit, connection_max_per_node, Limit]),
+    try
+        Connections = [rabbit_ct_client_helpers:open_unmanaged_connection(Config, 0)
+                       || _ <- lists:seq(1, Limit - 1)],
+        true = lists:all(fun(E) -> is_pid(E) end, Connections),
+        ?assertEqual(<<"ok">>, maps:get(status, http_get(Config, Path, ?OK))),
+
+        Last = rabbit_ct_client_helpers:open_unmanaged_connection(Config, 0),
+        true = is_pid(Last),
+        {error, not_allowed} = rabbit_ct_client_helpers:open_unmanaged_connection(Config, 0),
+        Body = http_get_failed(Config, Path),
+        ?assertEqual(<<"failed">>, maps:get(<<"status">>, Body)),
+        ?assertEqual(<<"total node connection limit is reached">>,
+                     maps:get(<<"reason">>, Body))
+    after
+        rabbit_ct_broker_helpers:close_all_connections(Config, 0, <<"test cleanup">>),
+        rabbit_ct_broker_helpers:rpc(
+          Config, 0, application, set_env, [rabbit, connection_max_per_node, infinity])
+    end,
     passed.
 
 reached_target_cluster_size_test(Config) ->
