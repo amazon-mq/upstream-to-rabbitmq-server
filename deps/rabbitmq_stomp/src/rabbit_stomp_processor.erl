@@ -439,14 +439,19 @@ process_connect(Implicit, Frame,
                       error("Bad CONNECT",
                             "Connection refused: vhost connection limit reached",
                             State);
+                  %% Close the socket so the client cannot retry CONNECT on it,
+                  %% and so a `stomp.max_connections' refusal does not count
+                  %% toward `connection_max_per_node' until `login_timeout'.
                   {error, node_connection_limit_exceeded} ->
-                      error("Bad CONNECT",
-                            "Connection refused: node connection limit reached",
-                            State);
+                      {stop, error_close,
+                       send_error("Bad CONNECT",
+                                  "Connection refused: node connection limit reached",
+                                  State)};
                   {error, total_node_connection_limit_exceeded} ->
-                      error("Bad CONNECT",
-                            "Connection refused: total node connection limit reached",
-                            State)
+                      {stop, error_close,
+                       send_error("Bad CONNECT",
+                                  "Connection refused: total node connection limit reached",
+                                  State)}
               end,
               case {Res1, Implicit} of
                   %% Success (Implicit)

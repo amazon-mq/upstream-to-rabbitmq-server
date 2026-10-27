@@ -136,6 +136,11 @@ rejects_when_count_equals_limit(Config) ->
     set_max_connections(Config, 1),
     {ok, S1} = connect(Config, plain),
     ?assertEqual({error, refused}, attempt(Config, plain)),
+    {ok, Sock} = open_socket(Config, plain),
+    ok = gen_tcp:send(Sock, connect_frame()),
+    {ok, Data} = gen_tcp:recv(Sock, 0, ?TIMEOUT),
+    ?assertEqual(<<"ERROR">>, parse_command(Data)),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, ?TIMEOUT)),
     close(S1, plain),
     await_local_count(Config, 0),
     ok.
@@ -161,6 +166,7 @@ count_decrements_on_disconnect(Config) ->
     ok.
 
 total_limit_refuses_stomp(Config) ->
+    ?awaitMatch(0, total_connection_count(Config), 30_000),
     set_total_limit(Config, 1),
     {ok, S1} = connect(Config, plain),
     {ok, Sock} = open_socket(Config, plain),
@@ -168,7 +174,8 @@ total_limit_refuses_stomp(Config) ->
     {ok, Data} = gen_tcp:recv(Sock, 0, ?TIMEOUT),
     ?assertEqual(<<"ERROR">>, parse_command(Data)),
     ?assertNotEqual(nomatch, binary:match(Data, <<"total node connection limit">>)),
-    gen_tcp:close(Sock),
+    ?assertEqual({error, closed}, gen_tcp:recv(Sock, 0, ?TIMEOUT)),
+    ?awaitMatch(1, total_connection_count(Config), 30_000),
     close(S1, plain),
     await_local_count(Config, 0),
     ok.
@@ -203,6 +210,9 @@ set_max_connections(Config, Value) ->
     ok = rabbit_ct_broker_helpers:rpc(
            Config, 0, application, set_env,
            [rabbitmq_stomp, max_connections, Value]).
+
+total_connection_count(Config) ->
+    rabbit_ct_broker_helpers:rpc(Config, 0, amq_connection_limit, count, []).
 
 set_total_limit(Config, Value) ->
     ok = rabbit_ct_broker_helpers:rpc(
