@@ -1071,11 +1071,9 @@ check_node_connection_limit(RanchRef) ->
             end
     end.
 
-%% Unconditional (no Ranch ref): also covers AMQP-over-WebSockets, counted under
-%% its own Web/WSS listener.
 -spec check_total_connection_limit() -> ok.
 check_total_connection_limit() ->
-    case rabbit_networking:over_total_connection_limit() of
+    case amq_connection_limit:over_limit() of
         false ->
             ok;
         {true, Limit} ->

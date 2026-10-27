@@ -8,13 +8,15 @@
 -compile([export_all, nowarn_export_all]).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
 
 -import(rabbit_web_mqtt_test_util,
         [connect/3]).
 
 all() ->
     [node_connection_limit_cross_transport,
-     total_connection_limit_cross_transport].
+     total_connection_limit_cross_transport,
+     total_connection_count_follows_web_mqtt_clients].
 
 suite() ->
     [{timetrap, {minutes, 2}}].
@@ -71,6 +73,7 @@ node_connection_limit_cross_transport(BaseConfig) ->
 
 total_connection_limit_cross_transport(BaseConfig) ->
     Config = [{websocket, true} | BaseConfig],
+    ?awaitMatch(0, total_connection_count(Config), 30000),
     ok = rabbit_ct_broker_helpers:rpc(
            BaseConfig, 0, application, set_env,
            [rabbit, connection_max_per_node, 2]),
@@ -94,3 +97,22 @@ total_connection_limit_cross_transport(BaseConfig) ->
                BaseConfig, 0, application, set_env,
                [rabbit, connection_max_per_node, infinity])
     end.
+
+total_connection_count_follows_web_mqtt_clients(BaseConfig) ->
+    Config = [{websocket, true} | BaseConfig],
+    ?awaitMatch(0, total_connection_count(Config), 30000),
+
+    C1 = connect(<<"web-mqtt-count-1">>, Config, [{ack_timeout, 1}]),
+    ?assertEqual(1, total_connection_count(Config)),
+    ok = emqtt:disconnect(C1),
+    ?awaitMatch(0, total_connection_count(Config), 30000),
+
+    C2 = connect(<<"web-mqtt-count-2">>, Config, [{ack_timeout, 1}]),
+    ?assertEqual(1, total_connection_count(Config)),
+    unlink(C2),
+    exit(C2, kill),
+    ?awaitMatch(0, total_connection_count(Config), 30000).
+
+total_connection_count(Config) ->
+    rabbit_ct_broker_helpers:rpc(
+      Config, 0, amq_connection_limit, count, []).

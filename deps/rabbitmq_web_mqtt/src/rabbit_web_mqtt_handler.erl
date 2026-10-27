@@ -152,6 +152,7 @@ info(Pid, Items) ->
 websocket_init(State0 = #state{socket = Sock}) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_CONN ++ [web_mqtt]}),
     rabbit_access_control:set_max_heap_size_unauthenticated(?APP_NAME),
+    ok = amq_connection_limit:register_connection(),
     case rabbit_net:connection_string(Sock, inbound) of
         {ok, ConnStr} ->
             ConnName = rabbit_data_coercion:to_binary(ConnStr),

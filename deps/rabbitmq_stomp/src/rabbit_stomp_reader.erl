@@ -65,6 +65,7 @@ init([SupHelperPid, Ref, Configuration]) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_CONN ++ [stomp]}),
     process_flag(trap_exit, true),
     rabbit_access_control:set_max_heap_size_unauthenticated(rabbitmq_stomp),
+    ok = amq_connection_limit:register_connection(),
     {ok, Sock} = rabbit_networking:handshake(Ref,
         application:get_env(rabbitmq_stomp, proxy_protocol, false)),
     RealSocket = rabbit_net:unwrap_socket(Sock),

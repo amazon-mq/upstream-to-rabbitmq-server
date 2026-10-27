@@ -24,6 +24,8 @@ groups() ->
      {limit_tests, [], [
                         node_connection_limit,
                         total_node_connection_limit,
+                        total_limit_refusal_stops_counting,
+                        total_limit_counts_unregistered_caller,
                         vhost_limit,
                         channel_consumers_limit,
                         node_channel_limit
@@ -100,18 +102,40 @@ node_connection_limit(Config) ->
     close_all_connections([C]),
     ok.
 
+total_limit_refusal_stops_counting(Config) ->
+    ?awaitMatch(0, total_count(Config), 30000),
+    set_node_limit(Config, connection_max_per_node, 0),
+    ?assertEqual({1, {true, 0}, 0},
+                 rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, refuse_registered, [])).
+
+total_limit_counts_unregistered_caller(Config) ->
+    ?awaitMatch(0, total_count(Config), 30000),
+    set_node_limit(Config, connection_max_per_node, 5),
+    ?assertEqual({false, 1},
+                 rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, admit_unregistered, [])).
+
+refuse_registered() ->
+    ok = amq_connection_limit:register_connection(),
+    Before = amq_connection_limit:count(),
+    Refused = amq_connection_limit:over_limit(),
+    {Before, Refused, amq_connection_limit:count()}.
+
+admit_unregistered() ->
+    Admitted = amq_connection_limit:over_limit(),
+    {Admitted, amq_connection_limit:count()}.
+
+total_count(Config) ->
+    rabbit_ct_broker_helpers:rpc(Config, 0, amq_connection_limit, count, []).
+
 total_node_connection_limit(Config) ->
-    %% Leave the per-listener `connection_max` unlimited so only the node-wide
-    %% `connection_max_per_node` can refuse, isolating the new code path.
+    %% Connections closed by the previous case leave the count asynchronously.
+    ?awaitMatch(0, rabbit_ct_broker_helpers:rpc(Config, 0,
+                     amq_connection_limit, count, []), 30000),
     set_node_limit(Config, connection_max, infinity),
     set_node_limit(Config, connection_max_per_node, 5),
     Connections = [rabbit_ct_client_helpers:open_unmanaged_connection(Config, 0)
                    || _ <- lists:seq(1, 5)],
     true = lists:all(fun(E) -> is_pid(E) end, Connections),
-    %% Ranch decrements active_connections asynchronously as prior-test readers
-    %% terminate, so the count settles rather than matching immediately.
-    ?awaitMatch(5, rabbit_ct_broker_helpers:rpc(Config, 0,
-                     rabbit_networking, total_connection_count, []), 30000),
     {error, not_allowed} = rabbit_ct_client_helpers:open_unmanaged_connection(Config, 0),
     close_all_connections(Connections),
     set_node_limit(Config, connection_max_per_node, infinity),

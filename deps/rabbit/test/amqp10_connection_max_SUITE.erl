@@ -11,6 +11,7 @@
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 -include_lib("amqp10_common/include/amqp10_framing.hrl").
 
@@ -108,9 +109,13 @@ node_connection_limit_shared_with_amqp091(Config) ->
     ok.
 
 total_connection_limit_amqp10(Config) ->
+    ?awaitMatch(0, rabbit_ct_broker_helpers:rpc(
+                     Config, 0, amq_connection_limit, count, []), 30000),
     set_total_limit(Config, 1),
     C1 = open_amqp10_ok(Config),
     {refused, _} = open_amqp10(Config),
+    ?awaitMatch(1, rabbit_ct_broker_helpers:rpc(
+                     Config, 0, amq_connection_limit, count, []), 30000),
     set_total_limit(Config, 2),
     C2 = open_amqp10_ok(Config),
     [amqp_utils:close_connection_sync(C) || C <- [C1, C2]],

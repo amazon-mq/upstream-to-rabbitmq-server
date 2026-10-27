@@ -165,6 +165,7 @@ init(Parent, HelperSups, Ref) ->
     logger:set_process_metadata(#{domain => ?RMQLOG_DOMAIN_CONN}),
     ?LG_PROCESS_TYPE(reader),
     rabbit_access_control:set_max_heap_size_unauthenticated(rabbit),
+    ok = amq_connection_limit:register_connection(),
     ProxyProtocolEnabled = application:get_env(rabbit, proxy_protocol, false),
     {ok, Sock} = rabbit_networking:handshake(Ref, ProxyProtocolEnabled, dynamic_buffer),
     Deb = sys:debug_options([]),
@@ -1455,7 +1456,7 @@ is_over_node_connection_limit(RanchRef) ->
     end.
 
 is_over_total_connection_limit() ->
-    case rabbit_networking:over_total_connection_limit() of
+    case amq_connection_limit:over_limit() of
         false -> ok;
         {true, Limit} ->
             rabbit_misc:protocol_error(not_allowed,

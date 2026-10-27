@@ -8,6 +8,7 @@
 -module(web_mqtt_system_SUITE).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
 
 -compile([export_all, nowarn_export_all]).
 
@@ -25,6 +26,7 @@ groups() ->
        ,handle_invalid_packets
        ,duplicate_connect
        ,wss_http2
+       ,wss_http2_streams_count_separately
       ]}
     ].
 
@@ -151,7 +153,27 @@ wss_http2(Config) ->
     gun:ws_send(ConnPid, StreamRef, {binary, rabbit_ws_test_util:mqtt_3_1_1_connect_packet()}),
     {ws, {binary, _P}} = gun:await(ConnPid, StreamRef),
     eventually(?_assertEqual(1, num_mqtt_connections(Config, 0))),
-    ok.
+    ok = gun:close(ConnPid).
+
+wss_http2_streams_count_separately(Config) ->
+    ?awaitMatch(0, connection_count(Config), 30_000),
+    {ok, _} = application:ensure_all_started(gun),
+    Port = rabbit_ct_broker_helpers:get_node_config(Config, 0, tcp_port_web_mqtt_tls),
+    {ok, ConnPid} = gun:open("localhost", Port, #{
+        transport => tls,
+        tls_opts => [{verify, verify_none}],
+        protocols => [http2],
+        http2_opts => #{notify_settings_changed => true},
+        ws_opts => #{protocols => [{<<"mqtt">>, gun_ws_h}]}
+    }),
+    {ok, http2} = gun:await_up(ConnPid),
+    {notify, settings_changed, #{enable_connect_protocol := true}}
+        = gun:await(ConnPid, undefined),
+    [{upgrade, [<<"websocket">>], _} = gun:await(ConnPid, gun:ws_upgrade(ConnPid, "/ws", []))
+     || _ <- [1, 2]],
+    ?awaitMatch(2, connection_count(Config), 30_000),
+    ok = gun:close(ConnPid),
+    ?awaitMatch(0, connection_count(Config), 30_000).
 
 %% -------------------------------------------------------------------
 %% Internal helpers
@@ -160,3 +182,6 @@ wss_http2(Config) ->
 %% Web mqtt connections are tracked together with mqtt connections
 num_mqtt_connections(Config, Node) ->
     length(rabbit_ct_broker_helpers:rpc(Config, Node, rabbit_mqtt, local_connection_pids, [])).
+
+connection_count(Config) ->
+    rabbit_ct_broker_helpers:rpc(Config, 0, amq_connection_limit, count, []).

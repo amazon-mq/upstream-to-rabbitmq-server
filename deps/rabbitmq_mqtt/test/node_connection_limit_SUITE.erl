@@ -66,9 +66,6 @@ end_per_testcase(Testcase, Config) ->
 %% Test cases
 %% -------------------------------------------------------------------
 
-%% connection_max_per_node is a single node-wide ceiling. An AMQP 0-9-1 and an
-%% MQTT connection must both count toward it and both be refused once it is
-%% reached, proving the limit spans protocols rather than any one listener.
 total_connection_limit_spans_protocols(Config) ->
     set_total_limit(Config, 2),
 
@@ -98,5 +95,4 @@ set_total_limit(Config, Value) ->
                                       [rabbit, connection_max_per_node, Value]).
 
 total_connection_count(Config) ->
-    rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_networking,
-                                 total_connection_count, []).
+    rabbit_ct_broker_helpers:rpc(Config, 0, amq_connection_limit, count, []).
