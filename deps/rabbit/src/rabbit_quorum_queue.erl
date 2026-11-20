@@ -1930,7 +1930,7 @@ maybe_grow(Q, Node, Membership, Size, QNodes) ->
         true ->
             ?LOG_INFO("~ts: adding a new member (replica) on node ~w",
                             [rabbit_misc:rs(QName), Node]),
-            case add_member(Q, Node, Membership) of
+            case add_member_with_retry(Q, Node, Membership) of
                 ok ->
                     {QName, {ok, Size + 1}};
                 {error, Err} ->
@@ -1945,6 +1945,21 @@ maybe_grow(Q, Node, Membership, Size, QNodes) ->
                     "~ts: failed to add member (replica) on node ~w, error: ~w",
                     [rabbit_misc:rs(QName), Node, Err]),
             {QName, {error, Size, Err}}
+    end.
+
+add_member_with_retry(Q, Node, Membership) ->
+    case add_member(Q, Node, Membership) of
+        {error, cluster_change_not_permitted} ->
+            %% Same as `shrink/2`: a previous membership change may not have
+            %% been committed yet, so retry once.
+            ?LOG_INFO("~ts: failed to add member (replica) on node ~w "
+                      "as cluster change is not permitted. "
+                      "retrying once in 500ms",
+                      [rabbit_misc:rs(amqqueue:get_name(Q)), Node]),
+            timer:sleep(500),
+            add_member(Q, Node, Membership);
+        Result ->
+            Result
     end.
 
 -spec transfer_leadership(amqqueue:amqqueue(), node()) ->
