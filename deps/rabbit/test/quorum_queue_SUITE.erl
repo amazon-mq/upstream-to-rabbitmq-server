@@ -142,9 +142,8 @@ groups() ->
                                             select_nodes_with_least_replicas,
                                             select_nodes_with_least_replicas_node_down,
                                             subscribe_from_each,
-                                            grow_queue
-
-
+                                            grow_queue,
+                                            grow_queue_concurrently
                                            ]},
                       {clustered_with_partitions, [],
                        [
@@ -2259,6 +2258,29 @@ grow_queue(Config) ->
                 end, Result7)
       end),
     assert_grown_queues(QQs, Server0, TargetClusterSize_5, MsgCount).
+
+grow_queue_concurrently(Config) ->
+    [Server0, Server1, Server2, _Server3, _Server4] =
+        rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server0),
+    QQ = ?config(queue_name, Config),
+    QQs = [<<QQ/binary, "-", (integer_to_binary(N))/binary>>
+           || N <- lists:seq(1, 20)],
+    [?assertEqual({'queue.declare_ok', Q, 0, 0},
+                  declare(Ch, Q, [{<<"x-queue-type">>, longstr, <<"quorum">>},
+                                  {<<"x-quorum-initial-group-size">>, long, 1}]))
+     || Q <- QQs],
+    Self = self(),
+    [spawn_link(fun () ->
+                        Self ! {grown, Node,
+                                rpc:call(Server0, rabbit_quorum_queue, grow,
+                                         [Node, <<"/">>, <<".*">>, all])}
+                end) || Node <- [Server1, Server2]],
+    Results = [receive {grown, Node, R} -> R
+               after 60000 -> ct:fail({grow_timeout, Node})
+               end || Node <- [Server1, Server2]],
+    ?assertEqual([], [E || R <- Results, {_, {error, _, _}} = E <- R]),
+    assert_grown_queues(QQs, Server0, 3, 0).
 
 assert_grown_queues(Qs, Node, TargetClusterSize, MsgCount) ->
     [begin
